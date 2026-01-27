@@ -2,7 +2,7 @@
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
 
-A production-grade Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. Implements Matrix Client-Server API v1.12 and Server-Server (Federation) API.
+An incomplete Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. Partially implements Matrix Client-Server API v1.12 and Server-Server (Federation) API.
 
 ## Table of Contents
 
@@ -23,7 +23,7 @@ A production-grade Matrix homeserver implementation running entirely on Cloudfla
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Cloudflare Edge Network                            │
+│                           Cloudflare Edge Network                           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │   Workers   │  │  Durable    │  │     D1      │  │         R2          │ │
@@ -37,8 +37,8 @@ A production-grade Matrix homeserver implementation running entirely on Cloudfla
 │         │         └─────────────┘  └─────────────┘            │             │
 │         │                │                │                   │             │
 │  ┌──────┴────────────────┴────────────────┴───────────────────┴───────────┐ │
-│  │                          KV Namespaces                                  │ │
-│  │  SESSIONS: Access tokens, refresh tokens                                │ │
+│  │                          KV Namespaces                                 │ │
+│  │  SESSIONS: Access tokens, refresh tokens                               │ │
 │  │  DEVICE_KEYS: E2EE device keys, cross-signing keys                     │ │
 │  │  CACHE: Room metadata, federation server keys                          │ │
 │  │  ONE_TIME_KEYS: Olm one-time keys for E2EE                             │ │
@@ -46,7 +46,7 @@ A production-grade Matrix homeserver implementation running entirely on Cloudfla
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                             │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                          Workflows (Durable Execution)                  │ │
+│  │                          Workflows (Durable Execution)                 │ │
 │  │  RoomJoinWorkflow: Federation handshake with retries                   │ │
 │  │  PushNotificationWorkflow: Batched push delivery                       │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
