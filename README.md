@@ -206,6 +206,8 @@ npx wrangler secret put EMAIL_FROM
 # Example: noreply@m.easydemo.org
 ```
 
+> **Note:** Cloudflare's native [Email Workers](https://developers.cloudflare.com/email-routing/email-workers/send-email-workers/) currently only support sending to pre-verified destination addresses, making them unsuitable for verification emails to arbitrary users. Resend is used as a workaround until Cloudflare releases transactional email support for Workers.
+
 ## Development
 
 ```bash
