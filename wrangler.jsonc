@@ -1,10 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "matrix-homeserver",
+  "name": "matrix-worker",
   "main": "src/index.ts",
   "compatibility_date": "2024-11-01",
   "compatibility_flags": ["nodejs_compat"],
-  "account_id": "YOUR_ACCOUNT_ID",
+  "account_id": "870e8509c92b6115e64a0cd8bb95ea97",
 
   "observability": {
     "enabled": true
@@ -14,8 +14,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "matrix-db",
-      "database_id": "YOUR_DATABASE_ID"
+      "database_name": "tuwunel-db",
+      "database_id": "36b31035-03de-40ed-8940-753d325bae27"
     }
   ],
 
@@ -23,27 +23,27 @@
   "kv_namespaces": [
     {
       "binding": "SESSIONS",
-      "id": "YOUR_SESSIONS_KV_ID"
+      "id": "366e0561b7054c2ebb07ceb44e8f92a5"
     },
     {
       "binding": "DEVICE_KEYS",
-      "id": "YOUR_DEVICE_KEYS_KV_ID"
+      "id": "9c44be58428049ddbc69727e0e0ff3ef"
     },
     {
       "binding": "CACHE",
-      "id": "YOUR_CACHE_KV_ID"
+      "id": "121081991bbb4b44806dd973ea185404"
     },
     {
       "binding": "CROSS_SIGNING_KEYS",
-      "id": "YOUR_CROSS_SIGNING_KEYS_KV_ID"
+      "id": "b3f387bf735b4fc684a25656f1808abc"
     },
     {
       "binding": "ACCOUNT_DATA",
-      "id": "YOUR_ACCOUNT_DATA_KV_ID"
+      "id": "326dab002ae54bc7a10b99daad566670"
     },
     {
       "binding": "ONE_TIME_KEYS",
-      "id": "YOUR_ONE_TIME_KEYS_KV_ID"
+      "id": "c3739acd328748f5a966c3b7ff2a6352"
     }
   ],
 
@@ -51,7 +51,7 @@
   "r2_buckets": [
     {
       "binding": "MEDIA",
-      "bucket_name": "matrix-media"
+      "bucket_name": "tuwunel-media"
     }
   ],
 
@@ -85,6 +85,10 @@
       {
         "name": "PUSH",
         "class_name": "PushDurableObject"
+      },
+      {
+        "name": "RATE_LIMIT",
+        "class_name": "RateLimitDurableObject"
       }
     ]
   },
@@ -109,16 +113,20 @@
     {
       "tag": "v5",
       "new_classes": ["PushDurableObject"]
+    },
+    {
+      "tag": "v6",
+      "new_classes": ["RateLimitDurableObject"]
     }
   ],
 
   // Environment variables
   "vars": {
-    "SERVER_NAME": "matrix.example.com",
+    "SERVER_NAME": "m.easydemo.org",
     "SERVER_VERSION": "0.1.0",
-    "TURN_KEY_ID": "YOUR_TURN_KEY_ID",
-    "LIVEKIT_API_KEY": "YOUR_LIVEKIT_API_KEY",
-    "LIVEKIT_URL": "wss://livekit.example.com"
+    "TURN_KEY_ID": "42586a3b6b8415d1e69e825f169f3108",
+    "LIVEKIT_API_KEY": "devkey",
+    "LIVEKIT_URL": "wss://livekit.easydemo.org"
   },
 
   // Secrets should be set using:
@@ -139,13 +147,21 @@
   // 3. Copy the App ID and App Secret
   // Or use the API: https://developers.cloudflare.com/api/resources/calls/subresources/sfu/methods/create/
 
-  // Custom domain routing (uncomment and update for production)
-  // "routes": [
-  //   {
-  //     "pattern": "matrix.example.com",
-  //     "custom_domain": true
-  //   }
-  // ],
+  // Custom domain routing
+  "routes": [
+    {
+      "pattern": "m.easydemo.org",
+      "custom_domain": true
+    }
+  ],
+
+  // Workers VPC for LiveKit connectivity
+  "vpc_services": [
+    {
+      "binding": "LIVEKIT_API",
+      "service_id": "019b6a8b-4d9e-7751-bef5-7d9a3f1807a9"
+    }
+  ],
 
   // Cloudflare Workflows for durable multi-step operations
   "workflows": [

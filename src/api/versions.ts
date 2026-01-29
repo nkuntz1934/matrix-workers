@@ -41,6 +41,38 @@ app.get('/.well-known/matrix/server', (c) => {
   });
 });
 
+// GET /.well-known/matrix/support - Server support contact information
+// Spec: https://spec.matrix.org/v1.17/client-server-api/#getwell-knownmatrixsupport
+app.get('/.well-known/matrix/support', (c) => {
+  const contacts: Array<{
+    role: string;
+    email_address?: string;
+    matrix_id?: string;
+  }> = [];
+
+  // Add admin contact if configured
+  if (c.env.ADMIN_CONTACT_EMAIL || c.env.ADMIN_CONTACT_MXID) {
+    contacts.push({
+      role: 'm.role.admin',
+      email_address: c.env.ADMIN_CONTACT_EMAIL,
+      matrix_id: c.env.ADMIN_CONTACT_MXID,
+    });
+  }
+
+  const response: {
+    contacts: typeof contacts;
+    support_page?: string;
+  } = {
+    contacts,
+  };
+
+  if (c.env.SUPPORT_PAGE_URL) {
+    response.support_page = c.env.SUPPORT_PAGE_URL;
+  }
+
+  return c.json(response);
+});
+
 // GET /_matrix/client/versions
 app.get('/_matrix/client/versions', (c) => {
   return c.json({
@@ -102,7 +134,7 @@ app.get('/_matrix/client/versions', (c) => {
 app.get('/_matrix/federation/v1/version', (c) => {
   return c.json({
     server: {
-      name: 'tuwunel-workers',
+      name: 'matrix-worker',
       version: c.env.SERVER_VERSION,
     },
   });

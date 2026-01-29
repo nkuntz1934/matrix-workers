@@ -1,25 +1,23 @@
 // Rate Limiting Middleware
-// Implements rate limiting using D1 for persistence and KV for fast checks
-//
+// Implements rate limiting using Durable Objects for persistence
 // Uses a sliding window algorithm with different limits for different endpoints
 
 import type { Context, Next } from 'hono';
 import type { AppEnv } from '../types';
 
-/* DISABLED - Rate limiting temporarily disabled due to KV rate limit issues
 // Rate limit configurations for different endpoint types
 const RATE_LIMITS: Record<string, { requests: number; windowMs: number }> = {
-  'login': { requests: 10, windowMs: 60 * 1000 },
-  'register': { requests: 5, windowMs: 60 * 1000 },
-  'default': { requests: 100, windowMs: 60 * 1000 },
-  'sync': { requests: 300, windowMs: 60 * 1000 },
-  'e2ee': { requests: 500, windowMs: 60 * 1000 },
-  'media_upload': { requests: 30, windowMs: 60 * 1000 },
-  'media_download': { requests: 200, windowMs: 60 * 1000 },
-  'search': { requests: 30, windowMs: 60 * 1000 },
-  'federation': { requests: 500, windowMs: 60 * 1000 },
-  'send_message': { requests: 60, windowMs: 60 * 1000 },
-  'create_room': { requests: 10, windowMs: 60 * 1000 },
+  login: { requests: 10, windowMs: 60 * 1000 }, // 10 per minute
+  register: { requests: 5, windowMs: 60 * 1000 }, // 5 per minute
+  default: { requests: 100, windowMs: 60 * 1000 }, // 100 per minute
+  sync: { requests: 300, windowMs: 60 * 1000 }, // 300 per minute (long-polling)
+  e2ee: { requests: 500, windowMs: 60 * 1000 }, // 500 per minute (key uploads)
+  media_upload: { requests: 30, windowMs: 60 * 1000 }, // 30 per minute
+  media_download: { requests: 200, windowMs: 60 * 1000 }, // 200 per minute
+  search: { requests: 30, windowMs: 60 * 1000 }, // 30 per minute
+  federation: { requests: 500, windowMs: 60 * 1000 }, // 500 per minute
+  send_message: { requests: 60, windowMs: 60 * 1000 }, // 60 per minute
+  create_room: { requests: 10, windowMs: 60 * 1000 }, // 10 per minute
 };
 
 function getRateLimitType(path: string, method: string): string {
@@ -36,7 +34,6 @@ function getRateLimitType(path: string, method: string): string {
   if (path.match(/\/rooms\/[^/]+\/send/) && method === 'PUT') return 'send_message';
   return 'default';
 }
-END OF DISABLED CODE */
 
 // Get client identifier (IP or user ID)
 function getClientId(c: Context<AppEnv>): string {
@@ -54,25 +51,18 @@ function getClientId(c: Context<AppEnv>): string {
   return `ip:${ip}`;
 }
 
-// Rate limiter using KV for fast checks
-// TEMPORARILY DISABLED: KV itself is hitting rate limits (429) which causes cascading failures
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-export async function rateLimitMiddleware(_c: Context<AppEnv>, next: Next) {
-  // DISABLED: Skip all rate limiting to avoid KV 429 errors
-  // The KV-based approach doesn't scale with high request volumes
-  return next();
-
-  /* DISABLED - KV rate limiting causing issues
-  const path = _c.req.path;
-  const method = _c.req.method;
+// Rate limiter using Durable Objects
+export async function rateLimitMiddleware(c: Context<AppEnv>, next: Next) {
+  const path = c.req.path;
+  const method = c.req.method;
 
   // Skip rate limiting for OPTIONS (CORS preflight)
   if (method === 'OPTIONS') {
     return next();
   }
 
-  // Skip rate limiting for sync endpoints to reduce KV writes
-  // Sync endpoints have their own natural rate limiting via timeout parameter
+  // Skip rate limiting for sync endpoints with long timeout
+  // These have natural rate limiting via the timeout parameter
   if (path.includes('/sync')) {
     return next();
   }
@@ -81,74 +71,60 @@ export async function rateLimitMiddleware(_c: Context<AppEnv>, next: Next) {
   const config = RATE_LIMITS[limitType];
   const clientId = getClientId(c);
 
-  // Create a unique key for this client + limit type
-  const key = `ratelimit:${limitType}:${clientId}`;
-  const now = Date.now();
-  const windowStart = now - config.windowMs;
+  // Use rate limit type as the DO ID to distribute load
+  // Each limit type gets its own DO instance
+  const doId = c.env.RATE_LIMIT.idFromName(limitType);
+  const stub = c.env.RATE_LIMIT.get(doId);
 
   try {
-    // Get current count from KV
-    const cached = await c.env.CACHE.get(key);
+    const response = await stub.fetch(
+      new Request('https://internal/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'check',
+          clientId,
+          limit: config.requests,
+          windowMs: config.windowMs,
+        }),
+      })
+    );
 
-    if (cached) {
-      const data = JSON.parse(cached) as { count: number; firstRequest: number };
+    const result = (await response.json()) as {
+      allowed: boolean;
+      remaining: number;
+      retryAfterMs?: number;
+      resetAt?: number;
+    };
 
-      // Check if we're still in the same window
-      if (data.firstRequest > windowStart) {
-        // Still in window, check count
-        if (data.count >= config.requests) {
-          // Rate limited
-          const retryAfter = Math.ceil((data.firstRequest + config.windowMs - now) / 1000);
+    // Set rate limit headers
+    c.header('X-RateLimit-Limit', String(config.requests));
+    c.header('X-RateLimit-Remaining', String(result.remaining));
+    if (result.resetAt) {
+      c.header('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
+    }
 
-          c.header('Retry-After', String(retryAfter));
-          c.header('X-RateLimit-Limit', String(config.requests));
-          c.header('X-RateLimit-Remaining', '0');
-          c.header('X-RateLimit-Reset', String(Math.ceil((data.firstRequest + config.windowMs) / 1000)));
+    if (!result.allowed) {
+      // Rate limited
+      const retryAfter = Math.ceil((result.retryAfterMs || config.windowMs) / 1000);
+      c.header('Retry-After', String(retryAfter));
 
-          return c.json({
-            errcode: 'M_LIMIT_EXCEEDED',
-            error: 'Too many requests',
-            retry_after_ms: retryAfter * 1000,
-          }, 429);
-        }
-
-        // Increment count
-        data.count++;
-        await c.env.CACHE.put(key, JSON.stringify(data), {
-          expirationTtl: Math.ceil(config.windowMs / 1000) + 1,
-        });
-
-        // Set rate limit headers
-        c.header('X-RateLimit-Limit', String(config.requests));
-        c.header('X-RateLimit-Remaining', String(config.requests - data.count));
-        c.header('X-RateLimit-Reset', String(Math.ceil((data.firstRequest + config.windowMs) / 1000)));
-      } else {
-        // Window expired, start new window
-        await c.env.CACHE.put(key, JSON.stringify({ count: 1, firstRequest: now }), {
-          expirationTtl: Math.ceil(config.windowMs / 1000) + 1,
-        });
-
-        c.header('X-RateLimit-Limit', String(config.requests));
-        c.header('X-RateLimit-Remaining', String(config.requests - 1));
-        c.header('X-RateLimit-Reset', String(Math.ceil((now + config.windowMs) / 1000)));
-      }
-    } else {
-      // First request in window
-      await c.env.CACHE.put(key, JSON.stringify({ count: 1, firstRequest: now }), {
-        expirationTtl: Math.ceil(config.windowMs / 1000) + 1,
-      });
-
-      c.header('X-RateLimit-Limit', String(config.requests));
-      c.header('X-RateLimit-Remaining', String(config.requests - 1));
-      c.header('X-RateLimit-Reset', String(Math.ceil((now + config.windowMs) / 1000)));
+      return c.json(
+        {
+          errcode: 'M_LIMIT_EXCEEDED',
+          error: 'Too many requests',
+          retry_after_ms: result.retryAfterMs || config.windowMs,
+        },
+        429
+      );
     }
   } catch (error) {
     // If rate limiting fails, allow the request (fail open)
+    // Log the error but don't block the request
     console.error('Rate limiting error:', error);
   }
 
   return next();
-  */ // End of disabled rate limiting code
 }
 
 // Stricter rate limiter for specific endpoints (can be used as route-specific middleware)
@@ -156,42 +132,43 @@ export function strictRateLimit(requests: number, windowMs: number) {
   return async (c: Context<AppEnv>, next: Next) => {
     const clientId = getClientId(c);
     const path = c.req.path;
-    const key = `ratelimit:strict:${path}:${clientId}`;
-    const now = Date.now();
-    const windowStart = now - windowMs;
+
+    // Use a unique DO ID for strict rate limits
+    const doId = c.env.RATE_LIMIT.idFromName(`strict:${path}`);
+    const stub = c.env.RATE_LIMIT.get(doId);
 
     try {
-      const cached = await c.env.CACHE.get(key);
+      const response = await stub.fetch(
+        new Request('https://internal/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'check',
+            clientId,
+            limit: requests,
+            windowMs,
+          }),
+        })
+      );
 
-      if (cached) {
-        const data = JSON.parse(cached) as { count: number; firstRequest: number };
+      const result = (await response.json()) as {
+        allowed: boolean;
+        remaining: number;
+        retryAfterMs?: number;
+      };
 
-        if (data.firstRequest > windowStart && data.count >= requests) {
-          const retryAfter = Math.ceil((data.firstRequest + windowMs - now) / 1000);
+      if (!result.allowed) {
+        const retryAfter = Math.ceil((result.retryAfterMs || windowMs) / 1000);
+        c.header('Retry-After', String(retryAfter));
 
-          c.header('Retry-After', String(retryAfter));
-
-          return c.json({
+        return c.json(
+          {
             errcode: 'M_LIMIT_EXCEEDED',
             error: 'Too many requests',
-            retry_after_ms: retryAfter * 1000,
-          }, 429);
-        }
-
-        if (data.firstRequest > windowStart) {
-          data.count++;
-          await c.env.CACHE.put(key, JSON.stringify(data), {
-            expirationTtl: Math.ceil(windowMs / 1000) + 1,
-          });
-        } else {
-          await c.env.CACHE.put(key, JSON.stringify({ count: 1, firstRequest: now }), {
-            expirationTtl: Math.ceil(windowMs / 1000) + 1,
-          });
-        }
-      } else {
-        await c.env.CACHE.put(key, JSON.stringify({ count: 1, firstRequest: now }), {
-          expirationTtl: Math.ceil(windowMs / 1000) + 1,
-        });
+            retry_after_ms: result.retryAfterMs || windowMs,
+          },
+          429
+        );
       }
     } catch (error) {
       console.error('Strict rate limiting error:', error);

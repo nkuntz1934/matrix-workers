@@ -52,7 +52,7 @@ app.put('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
 
   const now = Date.now();
 
-  // Store presence
+  // Store presence in D1
   await db.prepare(`
     INSERT INTO presence (user_id, presence, status_msg, last_active_ts)
     VALUES (?, ?, ?, ?)
@@ -61,6 +61,17 @@ app.put('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
       status_msg = excluded.status_msg,
       last_active_ts = excluded.last_active_ts
   `).bind(requestingUserId, presence, status_msg || null, now).run();
+
+  // Write-through to KV cache for fast reads (5 minute TTL)
+  await c.env.CACHE.put(
+    `presence:${requestingUserId}`,
+    JSON.stringify({
+      presence,
+      status_msg: status_msg || null,
+      last_active_ts: now,
+    }),
+    { expirationTtl: 5 * 60 } // 5 minutes
+  );
 
   return c.json({});
 });
@@ -79,16 +90,31 @@ app.get('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
     return Errors.notFound('User not found').toResponse();
   }
 
-  // Get presence
-  const presence = await db.prepare(`
-    SELECT presence, status_msg, last_active_ts
-    FROM presence
-    WHERE user_id = ?
-  `).bind(targetUserId).first<{
+  // Try KV cache first for faster reads
+  const cached = await c.env.CACHE.get(`presence:${targetUserId}`, 'json') as {
     presence: string;
     status_msg: string | null;
     last_active_ts: number;
-  }>();
+  } | null;
+
+  let presence: {
+    presence: string;
+    status_msg: string | null;
+    last_active_ts: number;
+  } | null = cached;
+
+  // Fall back to D1 if not in cache
+  if (!presence) {
+    presence = await db.prepare(`
+      SELECT presence, status_msg, last_active_ts
+      FROM presence
+      WHERE user_id = ?
+    `).bind(targetUserId).first<{
+      presence: string;
+      status_msg: string | null;
+      last_active_ts: number;
+    }>();
+  }
 
   if (!presence) {
     // Default to offline if no presence set
@@ -120,9 +146,11 @@ app.get('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
 // ============================================
 
 // Get presence for multiple users (for sync)
+// This function requires KVNamespace to be passed for caching
 export async function getPresenceForUsers(
   db: D1Database,
-  userIds: string[]
+  userIds: string[],
+  cache?: KVNamespace
 ): Promise<Record<string, {
   presence: string;
   status_msg?: string;
@@ -132,19 +160,6 @@ export async function getPresenceForUsers(
   if (userIds.length === 0) return {};
 
   const now = Date.now();
-  const placeholders = userIds.map(() => '?').join(',');
-
-  const results = await db.prepare(`
-    SELECT user_id, presence, status_msg, last_active_ts
-    FROM presence
-    WHERE user_id IN (${placeholders})
-  `).bind(...userIds).all<{
-    user_id: string;
-    presence: string;
-    status_msg: string | null;
-    last_active_ts: number;
-  }>();
-
   const byUser: Record<string, {
     presence: string;
     status_msg?: string;
@@ -152,19 +167,67 @@ export async function getPresenceForUsers(
     currently_active?: boolean;
   }> = {};
 
-  for (const row of results.results) {
-    const isActive = (now - row.last_active_ts) < PRESENCE_TIMEOUT;
-    let effectivePresence = row.presence;
-    if (row.presence === 'online' && !isActive) {
-      effectivePresence = 'unavailable';
-    }
+  const uncachedUserIds: string[] = [];
 
-    byUser[row.user_id] = {
-      presence: effectivePresence,
-      status_msg: row.status_msg || undefined,
-      last_active_ago: now - row.last_active_ts,
-      currently_active: isActive && row.presence === 'online',
-    };
+  // Try to get from KV cache first
+  if (cache) {
+    for (const userId of userIds) {
+      const cached = await cache.get(`presence:${userId}`, 'json') as {
+        presence: string;
+        status_msg: string | null;
+        last_active_ts: number;
+      } | null;
+
+      if (cached) {
+        const isActive = (now - cached.last_active_ts) < PRESENCE_TIMEOUT;
+        let effectivePresence = cached.presence;
+        if (cached.presence === 'online' && !isActive) {
+          effectivePresence = 'unavailable';
+        }
+
+        byUser[userId] = {
+          presence: effectivePresence,
+          status_msg: cached.status_msg || undefined,
+          last_active_ago: now - cached.last_active_ts,
+          currently_active: isActive && cached.presence === 'online',
+        };
+      } else {
+        uncachedUserIds.push(userId);
+      }
+    }
+  } else {
+    uncachedUserIds.push(...userIds);
+  }
+
+  // Fall back to D1 for uncached users
+  if (uncachedUserIds.length > 0) {
+    const placeholders = uncachedUserIds.map(() => '?').join(',');
+
+    const results = await db.prepare(`
+      SELECT user_id, presence, status_msg, last_active_ts
+      FROM presence
+      WHERE user_id IN (${placeholders})
+    `).bind(...uncachedUserIds).all<{
+      user_id: string;
+      presence: string;
+      status_msg: string | null;
+      last_active_ts: number;
+    }>();
+
+    for (const row of results.results) {
+      const isActive = (now - row.last_active_ts) < PRESENCE_TIMEOUT;
+      let effectivePresence = row.presence;
+      if (row.presence === 'online' && !isActive) {
+        effectivePresence = 'unavailable';
+      }
+
+      byUser[row.user_id] = {
+        presence: effectivePresence,
+        status_msg: row.status_msg || undefined,
+        last_active_ago: now - row.last_active_ts,
+        currently_active: isActive && row.presence === 'online',
+      };
+    }
   }
 
   return byUser;

@@ -22,13 +22,24 @@ export interface Env {
   ADMIN: DurableObjectNamespace;
   USER_KEYS: DurableObjectNamespace;
   PUSH: DurableObjectNamespace;
+  RATE_LIMIT: DurableObjectNamespace;
 
   // Environment variables
   SERVER_NAME: string;
   SERVER_VERSION: string;
 
+  // Support contact info (optional)
+  ADMIN_CONTACT_EMAIL?: string;
+  ADMIN_CONTACT_MXID?: string;
+  SUPPORT_PAGE_URL?: string;
+
   // Secrets (to be configured)
   SIGNING_KEY?: string;
+
+  // OIDC encryption key for client secrets (32 random bytes, base64 encoded)
+  // Generate with: openssl rand -base64 32
+  // Set with: npx wrangler secret put OIDC_ENCRYPTION_KEY
+  OIDC_ENCRYPTION_KEY?: string;
 
   // Cloudflare TURN Server Configuration
   TURN_KEY_ID?: string;

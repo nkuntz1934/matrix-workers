@@ -5,6 +5,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateOpaqueId } from '../utils/ids';
+import { validateUrlForPreview } from '../utils/url-validator';
 
 const app = new Hono<AppEnv>();
 
@@ -222,17 +223,21 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
     return Errors.missingParam('url').toResponse();
   }
 
-  try {
-    // Validate URL
-    const parsedUrl = new URL(url);
-
-    // Only allow http/https
-    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-      return c.json({
+  // Validate URL for SSRF protection
+  const validation = validateUrlForPreview(url);
+  if (!validation.valid) {
+    return c.json(
+      {
         errcode: 'M_UNKNOWN',
-        error: 'Invalid URL protocol',
-      }, 400);
-    }
+        error: validation.error || 'Invalid URL',
+      },
+      400
+    );
+  }
+
+  try {
+    // Use the sanitized URL
+    const parsedUrl = new URL(validation.sanitizedUrl!);
 
     // Check cache first
     const cacheKey = `preview:${url}`;
@@ -593,15 +598,21 @@ app.get('/_matrix/client/v1/media/preview_url', requireAuth(), async (c) => {
     return Errors.missingParam('url').toResponse();
   }
 
-  try {
-    const parsedUrl = new URL(url);
-
-    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-      return c.json({
+  // Validate URL for SSRF protection
+  const validation = validateUrlForPreview(url);
+  if (!validation.valid) {
+    return c.json(
+      {
         errcode: 'M_UNKNOWN',
-        error: 'Invalid URL protocol',
-      }, 400);
-    }
+        error: validation.error || 'Invalid URL',
+      },
+      400
+    );
+  }
+
+  try {
+    // Use the sanitized URL
+    const parsedUrl = new URL(validation.sanitizedUrl!);
 
     const cacheKey = `preview:${url}`;
     const cached = await c.env.CACHE.get(cacheKey);

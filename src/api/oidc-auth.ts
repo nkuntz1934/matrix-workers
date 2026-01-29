@@ -50,52 +50,92 @@ interface OAuthState {
   returnTo?: string;
 }
 
-// Simple encryption for client secrets (in production, use a proper KMS)
-// This uses AES-GCM with a key derived from SERVER_NAME
-async function encryptSecret(secret: string, env: { SERVER_NAME: string }): Promise<string> {
+// Version byte for encrypted secrets
+// 0x01 = legacy (SERVER_NAME-based key) - INSECURE, kept for migration
+// 0x02 = secure (OIDC_ENCRYPTION_KEY)
+const ENCRYPTION_VERSION_LEGACY = 0x01;
+const ENCRYPTION_VERSION_SECURE = 0x02;
+
+// Get the encryption key (prefer OIDC_ENCRYPTION_KEY, fall back to SERVER_NAME for legacy)
+async function getEncryptionKey(
+  env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string },
+  version: number
+): Promise<CryptoKey> {
   const encoder = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
+
+  if (version === ENCRYPTION_VERSION_SECURE && env.OIDC_ENCRYPTION_KEY) {
+    // Use the secure key (base64-encoded 32 bytes)
+    const keyBytes = Uint8Array.from(atob(env.OIDC_ENCRYPTION_KEY), (c) => c.charCodeAt(0));
+    if (keyBytes.length !== 32) {
+      throw new Error('OIDC_ENCRYPTION_KEY must be 32 bytes (base64 encoded)');
+    }
+    return crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  }
+
+  // Legacy key derivation (INSECURE - only for decrypting old secrets)
+  console.warn('Using legacy OIDC encryption - please set OIDC_ENCRYPTION_KEY');
+  return crypto.subtle.importKey(
     'raw',
     encoder.encode(env.SERVER_NAME.padEnd(32, '0').slice(0, 32)),
     'AES-GCM',
     false,
-    ['encrypt']
+    ['encrypt', 'decrypt']
   );
+}
+
+// Encrypt a secret using AES-GCM
+// Uses OIDC_ENCRYPTION_KEY if available, otherwise falls back to SERVER_NAME (legacy)
+async function encryptSecret(
+  secret: string,
+  env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string }
+): Promise<string> {
+  const encoder = new TextEncoder();
+
+  // Determine which version to use
+  const version = env.OIDC_ENCRYPTION_KEY ? ENCRYPTION_VERSION_SECURE : ENCRYPTION_VERSION_LEGACY;
+  const keyMaterial = await getEncryptionKey(env, version);
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    keyMaterial,
-    encoder.encode(secret)
-  );
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, keyMaterial, encoder.encode(secret));
 
-  // Combine IV and ciphertext
-  const combined = new Uint8Array(iv.length + new Uint8Array(encrypted).length);
-  combined.set(iv);
-  combined.set(new Uint8Array(encrypted), iv.length);
+  // Combine version byte, IV, and ciphertext
+  const encryptedBytes = new Uint8Array(encrypted);
+  const combined = new Uint8Array(1 + iv.length + encryptedBytes.length);
+  combined[0] = version;
+  combined.set(iv, 1);
+  combined.set(encryptedBytes, 1 + iv.length);
 
   return btoa(String.fromCharCode(...combined));
 }
 
-async function decryptSecret(encryptedSecret: string, env: { SERVER_NAME: string }): Promise<string> {
-  const encoder = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(env.SERVER_NAME.padEnd(32, '0').slice(0, 32)),
-    'AES-GCM',
-    false,
-    ['decrypt']
-  );
+// Decrypt a secret
+// Automatically detects version and uses appropriate key
+async function decryptSecret(
+  encryptedSecret: string,
+  env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string }
+): Promise<string> {
+  const combined = Uint8Array.from(atob(encryptedSecret), (c) => c.charCodeAt(0));
 
-  const combined = Uint8Array.from(atob(encryptedSecret), c => c.charCodeAt(0));
-  const iv = combined.slice(0, 12);
-  const ciphertext = combined.slice(12);
+  // Check if this is a versioned secret (starts with 0x01 or 0x02)
+  let version: number;
+  let iv: Uint8Array;
+  let ciphertext: Uint8Array;
 
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    keyMaterial,
-    ciphertext
-  );
+  if (combined[0] === ENCRYPTION_VERSION_LEGACY || combined[0] === ENCRYPTION_VERSION_SECURE) {
+    // New format with version byte
+    version = combined[0];
+    iv = combined.slice(1, 13);
+    ciphertext = combined.slice(13);
+  } else {
+    // Old format without version byte (legacy)
+    version = ENCRYPTION_VERSION_LEGACY;
+    iv = combined.slice(0, 12);
+    ciphertext = combined.slice(12);
+  }
+
+  const keyMaterial = await getEncryptionKey(env, version);
+
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keyMaterial, ciphertext);
 
   return new TextDecoder().decode(decrypted);
 }
@@ -399,6 +439,48 @@ Device ID: ${deviceId}\`;
 </body>
 </html>`;
 }
+
+// GET /_matrix/client/v1/auth_metadata - Get authentication metadata
+// Returns information about supported authentication methods (MSC2965 / Matrix v1.17)
+app.get('/_matrix/client/v1/auth_metadata', async (c) => {
+  const db = c.env.DB;
+
+  // Check if any OIDC providers are configured and enabled
+  const providers = await db.prepare(`
+    SELECT id, name, issuer_url FROM idp_providers WHERE enabled = 1 LIMIT 1
+  `).all<{ id: string; name: string; issuer_url: string }>();
+
+  const response: Record<string, unknown> = {
+    homeserver: {
+      base_url: `https://${c.env.SERVER_NAME}`,
+    },
+  };
+
+  // If OIDC providers are configured, include issuer information
+  if (providers.results.length > 0) {
+    const firstProvider = providers.results[0];
+    try {
+      // Fetch OIDC discovery to get proper endpoints
+      const discovery = await fetchOIDCDiscovery(firstProvider.issuer_url);
+      // Cast through unknown to access optional properties not in our minimal interface
+      const discoveryAny = discovery as unknown as Record<string, unknown>;
+      response.issuer = discovery.issuer;
+      response.authorization_endpoint = discovery.authorization_endpoint;
+      response.token_endpoint = discovery.token_endpoint;
+      if (discoveryAny.registration_endpoint) {
+        response.registration_endpoint = discoveryAny.registration_endpoint;
+      }
+      if (discoveryAny.revocation_endpoint) {
+        response.revocation_endpoint = discoveryAny.revocation_endpoint;
+      }
+    } catch (err) {
+      // If discovery fails, just return homeserver info without OIDC metadata
+      console.error('Failed to fetch OIDC discovery for auth_metadata:', err);
+    }
+  }
+
+  return c.json(response);
+});
 
 // Export encryption helpers for admin API
 export { encryptSecret, decryptSecret };

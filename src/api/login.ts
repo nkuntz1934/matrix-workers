@@ -8,6 +8,7 @@ import {
   formatUserId,
   generateDeviceId,
   generateAccessToken,
+  generateRefreshToken,
   generateOpaqueId,
   isValidLocalpart,
 } from '../utils/ids';
@@ -34,6 +35,9 @@ app.get('/_matrix/client/v3/login', (c) => {
       },
       {
         type: 'm.login.token',
+      },
+      {
+        type: 'm.login.dummy',
       },
     ],
   });
@@ -110,6 +114,23 @@ app.post('/_matrix/client/v3/login', async (c) => {
     if (!valid) {
       return Errors.forbidden('Invalid username or password').toResponse();
     }
+  } else if (type === 'm.login.dummy') {
+    // m.login.dummy is for UIA flows - requires identifier but no password verification
+    // Per Matrix spec, this "does nothing and never fails" but still needs a user identifier
+    if (!identifier) {
+      return Errors.missingParam('identifier').toResponse();
+    }
+
+    // Parse identifier
+    if (identifier.type === 'm.id.user') {
+      if (identifier.user.startsWith('@')) {
+        userId = identifier.user;
+      } else {
+        userId = formatUserId(identifier.user, c.env.SERVER_NAME);
+      }
+    } else {
+      return Errors.unrecognized('Unknown identifier type').toResponse();
+    }
   } else {
     return Errors.unrecognized('Unknown login type').toResponse();
   }
@@ -136,11 +157,32 @@ app.post('/_matrix/client/v3/login', async (c) => {
 
   await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
 
+  // Generate refresh token and store in KV with auto-expiration
+  const refreshToken = await generateRefreshToken();
+  const refreshTokenHash = await hashToken(refreshToken);
+
+  // Store refresh token in KV with 7-day TTL
+  await c.env.SESSIONS.put(
+    `refresh:${refreshTokenHash}`,
+    JSON.stringify({
+      userId,
+      deviceId,
+      accessTokenId: tokenId,
+      createdAt: Date.now(),
+    }),
+    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+  );
+
+  // Access token expires in 1 hour (client should use refresh before this)
+  const expiresInMs = 60 * 60 * 1000; // 1 hour
+
   return c.json({
     user_id: userId,
     access_token: accessToken,
     device_id: deviceId,
     home_server: c.env.SERVER_NAME,
+    refresh_token: refreshToken,
+    expires_in_ms: expiresInMs,
   });
 });
 
@@ -159,6 +201,81 @@ app.post('/_matrix/client/v3/logout/all', requireAuth(), async (c) => {
   const userId = c.get('userId');
   await deleteAllUserTokens(c.env.DB, userId);
   return c.json({});
+});
+
+// POST /_matrix/client/v3/refresh - Refresh access token
+// Uses the refresh token to get a new access token + refresh token pair
+// Implements token rotation (single-use refresh tokens)
+app.post('/_matrix/client/v3/refresh', async (c) => {
+  let body: { refresh_token?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const { refresh_token: refreshToken } = body;
+
+  if (!refreshToken) {
+    return Errors.missingParam('refresh_token').toResponse();
+  }
+
+  // Hash the incoming refresh token
+  const refreshTokenHash = await hashToken(refreshToken);
+
+  // Look up in KV
+  const tokenData = await c.env.SESSIONS.get(`refresh:${refreshTokenHash}`, 'json') as {
+    userId: string;
+    deviceId: string | null;
+    accessTokenId: string;
+    createdAt: number;
+  } | null;
+
+  if (!tokenData) {
+    return Errors.unknownToken('Invalid or expired refresh token').toResponse();
+  }
+
+  const { userId, deviceId, accessTokenId } = tokenData;
+
+  // Delete old refresh token from KV (token rotation - single use)
+  await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);
+
+  // Delete old access token from D1
+  await c.env.DB.prepare(
+    `DELETE FROM access_tokens WHERE token_id = ?`
+  ).bind(accessTokenId).run();
+
+  // Generate new access token
+  const newAccessToken = await generateAccessToken();
+  const newTokenHash = await hashToken(newAccessToken);
+  const newTokenId = await generateOpaqueId(16);
+
+  await createAccessToken(c.env.DB, newTokenId, newTokenHash, userId, deviceId);
+
+  // Generate new refresh token
+  const newRefreshToken = await generateRefreshToken();
+  const newRefreshTokenHash = await hashToken(newRefreshToken);
+
+  // Store new refresh token in KV with 7-day TTL
+  await c.env.SESSIONS.put(
+    `refresh:${newRefreshTokenHash}`,
+    JSON.stringify({
+      userId,
+      deviceId,
+      accessTokenId: newTokenId,
+      createdAt: Date.now(),
+    }),
+    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+  );
+
+  // Access token expires in 1 hour
+  const expiresInMs = 60 * 60 * 1000;
+
+  return c.json({
+    access_token: newAccessToken,
+    refresh_token: newRefreshToken,
+    expires_in_ms: expiresInMs,
+  });
 });
 
 // GET /_matrix/client/v3/register/available - Check if username is available
@@ -267,11 +384,32 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
 
+  // Generate refresh token and store in KV with auto-expiration
+  const refreshToken = await generateRefreshToken();
+  const refreshTokenHash = await hashToken(refreshToken);
+
+  // Store refresh token in KV with 7-day TTL
+  await c.env.SESSIONS.put(
+    `refresh:${refreshTokenHash}`,
+    JSON.stringify({
+      userId,
+      deviceId,
+      accessTokenId: tokenId,
+      createdAt: Date.now(),
+    }),
+    { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+  );
+
+  // Access token expires in 1 hour
+  const expiresInMs = 60 * 60 * 1000;
+
   return c.json({
     user_id: userId,
     access_token: accessToken,
     device_id: deviceId,
     home_server: c.env.SERVER_NAME,
+    refresh_token: refreshToken,
+    expires_in_ms: expiresInMs,
   });
 });
 

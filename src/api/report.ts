@@ -90,6 +90,101 @@ app.post('/_matrix/client/v3/rooms/:roomId/report/:eventId', requireAuth(), asyn
   return c.json({});
 });
 
+// POST /_matrix/client/v3/rooms/:roomId/report - Report a room
+app.post('/_matrix/client/v3/rooms/:roomId/report', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const roomId = c.req.param('roomId');
+  const db = c.env.DB;
+
+  let body: { reason?: string; score?: number };
+  try {
+    body = await c.req.json();
+  } catch {
+    body = {};
+  }
+
+  const reason = body.reason || '';
+  const score = typeof body.score === 'number' ? Math.max(-100, Math.min(0, body.score)) : -100;
+
+  // Check if room exists
+  const room = await db.prepare(`
+    SELECT room_id FROM rooms WHERE room_id = ?
+  `).bind(roomId).first();
+
+  if (!room) {
+    return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Check for duplicate report (using NULL event_id for room reports)
+  const existing = await db.prepare(`
+    SELECT id FROM content_reports
+    WHERE reporter_user_id = ? AND room_id = ? AND event_id IS NULL AND report_type = 'room'
+  `).bind(userId, roomId).first();
+
+  if (existing) {
+    // Update existing report
+    await db.prepare(`
+      UPDATE content_reports SET reason = ?, score = ?, created_at = ?
+      WHERE reporter_user_id = ? AND room_id = ? AND event_id IS NULL AND report_type = 'room'
+    `).bind(reason, score, Date.now(), userId, roomId).run();
+  } else {
+    // Create new report
+    await db.prepare(`
+      INSERT INTO content_reports (reporter_user_id, room_id, event_id, reason, score, created_at, report_type)
+      VALUES (?, ?, NULL, ?, ?, ?, 'room')
+    `).bind(userId, roomId, reason, score, Date.now()).run();
+  }
+
+  return c.json({});
+});
+
+// POST /_matrix/client/v3/users/:reportedUserId/report - Report a user
+app.post('/_matrix/client/v3/users/:reportedUserId/report', requireAuth(), async (c) => {
+  const reporterId = c.get('userId');
+  const reportedUserId = decodeURIComponent(c.req.param('reportedUserId'));
+  const db = c.env.DB;
+
+  let body: { reason?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    body = {};
+  }
+
+  const reason = body.reason || '';
+
+  // Check if reported user exists
+  const user = await db.prepare(`
+    SELECT user_id FROM users WHERE user_id = ?
+  `).bind(reportedUserId).first();
+
+  if (!user) {
+    return Errors.notFound('User not found').toResponse();
+  }
+
+  // Check for duplicate report
+  const existing = await db.prepare(`
+    SELECT id FROM content_reports
+    WHERE reporter_user_id = ? AND reported_user_id = ? AND report_type = 'user'
+  `).bind(reporterId, reportedUserId).first();
+
+  if (existing) {
+    // Update existing report
+    await db.prepare(`
+      UPDATE content_reports SET reason = ?, created_at = ?
+      WHERE reporter_user_id = ? AND reported_user_id = ? AND report_type = 'user'
+    `).bind(reason, Date.now(), reporterId, reportedUserId).run();
+  } else {
+    // Create new report
+    await db.prepare(`
+      INSERT INTO content_reports (reporter_user_id, room_id, event_id, reason, score, created_at, report_type, reported_user_id)
+      VALUES (?, NULL, NULL, ?, -100, ?, 'user', ?)
+    `).bind(reporterId, reason, Date.now(), reportedUserId).run();
+  }
+
+  return c.json({});
+});
+
 // ============================================
 // Admin Endpoints for Managing Reports
 // ============================================

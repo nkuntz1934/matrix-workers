@@ -1,7 +1,7 @@
 // Matrix sync endpoint
 
 import { Hono } from 'hono';
-import type { AppEnv, SyncResponse, JoinedRoom, InvitedRoom, LeftRoom } from '../types';
+import type { AppEnv, SyncResponse, JoinedRoom, InvitedRoom, LeftRoom, Env } from '../types';
 import { requireAuth } from '../middleware/auth';
 import {
   getUserRooms,
@@ -16,6 +16,130 @@ import {
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
+
+// ============================================
+// Sync Filter Types and Helpers
+// ============================================
+
+interface EventFilter {
+  types?: string[];
+  not_types?: string[];
+  senders?: string[];
+  not_senders?: string[];
+  limit?: number;
+}
+
+interface RoomFilter {
+  rooms?: string[];
+  not_rooms?: string[];
+  timeline?: EventFilter;
+  state?: EventFilter;
+  ephemeral?: EventFilter;
+  account_data?: EventFilter;
+  include_leave?: boolean;
+}
+
+interface SyncFilter {
+  room?: RoomFilter;
+  presence?: EventFilter;
+  account_data?: EventFilter;
+  event_format?: 'client' | 'federation';
+  event_fields?: string[];
+}
+
+// Load a filter from KV storage or parse inline JSON
+async function loadFilter(env: Env, userId: string, filterParam?: string): Promise<SyncFilter | null> {
+  if (!filterParam) return null;
+
+  // Check if it's inline JSON (starts with '{')
+  if (filterParam.startsWith('{')) {
+    try {
+      return JSON.parse(filterParam);
+    } catch {
+      console.warn('[sync] Failed to parse inline filter JSON');
+      return null;
+    }
+  }
+
+  // Otherwise it's a filter ID - load from KV
+  const filterJson = await env.CACHE.get(`filter:${userId}:${filterParam}`);
+  if (!filterJson) {
+    console.warn('[sync] Filter not found:', filterParam);
+    return null;
+  }
+
+  try {
+    return JSON.parse(filterJson);
+  } catch {
+    console.warn('[sync] Failed to parse stored filter JSON');
+    return null;
+  }
+}
+
+// Apply an event filter to a list of events
+function applyEventFilter(events: any[], filter?: EventFilter): any[] {
+  if (!filter) return events;
+
+  let result = events.filter(event => {
+    // Filter by type whitelist
+    if (filter.types && filter.types.length > 0) {
+      const matches = filter.types.some(pattern => {
+        if (pattern.endsWith('*')) {
+          return event.type.startsWith(pattern.slice(0, -1));
+        }
+        return event.type === pattern;
+      });
+      if (!matches) return false;
+    }
+
+    // Filter by type blacklist
+    if (filter.not_types && filter.not_types.length > 0) {
+      const excluded = filter.not_types.some(pattern => {
+        if (pattern.endsWith('*')) {
+          return event.type.startsWith(pattern.slice(0, -1));
+        }
+        return event.type === pattern;
+      });
+      if (excluded) return false;
+    }
+
+    // Filter by sender whitelist
+    if (filter.senders && filter.senders.length > 0) {
+      if (!filter.senders.includes(event.sender)) return false;
+    }
+
+    // Filter by sender blacklist
+    if (filter.not_senders && filter.not_senders.length > 0) {
+      if (filter.not_senders.includes(event.sender)) return false;
+    }
+
+    return true;
+  });
+
+  // Apply limit
+  if (filter.limit && filter.limit > 0) {
+    result = result.slice(0, filter.limit);
+  }
+
+  return result;
+}
+
+// Check if a room should be included based on room filter
+function shouldIncludeRoom(roomId: string, filter?: RoomFilter): boolean {
+  if (!filter) return true;
+
+  // Room whitelist
+  if (filter.rooms && filter.rooms.length > 0) {
+    if (!filter.rooms.includes(roomId)) return false;
+  }
+
+  // Room blacklist
+  if (filter.not_rooms && filter.not_rooms.length > 0) {
+    if (filter.not_rooms.includes(roomId)) return false;
+  }
+
+  return true;
+}
 
 // Helper to get one-time key counts for a device
 async function getOneTimeKeyCounts(
@@ -132,6 +256,13 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Parse query parameters
   const since = c.req.query('since');
   const fullState = c.req.query('full_state') === 'true';
+  const filterParam = c.req.query('filter');
+
+  // Load filter if specified
+  const filter = await loadFilter(c.env, userId, filterParam);
+  if (filterParam && !filter) {
+    console.log('[sync] Using no filter (filter not found or invalid)');
+  }
 
   // Parse composite sync token (separate positions for events and to-device)
   const { events: sincePosition, toDevice: sinceToDevice } = parseSyncToken(since);
@@ -209,11 +340,13 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Get global account data
   // For initial sync (no since token), get all account data
   // For incremental sync, only get changed account data since last sync
-  const globalAccountData = await getGlobalAccountData(
+  let globalAccountData = await getGlobalAccountData(
     c.env.DB,
     userId,
     sincePosition > 0 ? sincePosition : undefined
   );
+  // Apply account_data filter to global account data
+  globalAccountData = applyEventFilter(globalAccountData, filter?.account_data);
   response.account_data!.events = globalAccountData;
 
   // Debug: Log global account_data that will be returned (for initial sync)
@@ -225,6 +358,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Get user's joined rooms
   const joinedRoomIds = await getUserRooms(c.env.DB, userId, 'join');
   for (const roomId of joinedRoomIds) {
+    // Check if room should be included based on filter
+    if (!shouldIncludeRoom(roomId, filter?.room)) {
+      continue;
+    }
+
     const joinedRoom: JoinedRoom = {
       timeline: {
         events: [],
@@ -245,8 +383,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const events = await getEventsSince(c.env.DB, roomId, sincePosition);
 
     // Separate state and timeline events
-    const stateEvents: any[] = [];
-    const timelineEvents: any[] = [];
+    let stateEvents: any[] = [];
+    let timelineEvents: any[] = [];
 
     for (const event of events) {
       const clientEvent = {
@@ -287,17 +425,23 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       }
     }
 
+    // Apply filters to state and timeline events
+    stateEvents = applyEventFilter(stateEvents, filter?.room?.state);
+    timelineEvents = applyEventFilter(timelineEvents, filter?.room?.timeline);
+
     joinedRoom.state!.events = stateEvents;
     joinedRoom.timeline!.events = timelineEvents;
     joinedRoom.timeline!.prev_batch = sincePosition.toString();
 
     // Get room-level account data
-    const roomAccountData = await getRoomAccountData(
+    let roomAccountData = await getRoomAccountData(
       c.env.DB,
       userId,
       roomId,
       sincePosition > 0 ? sincePosition : undefined
     );
+    // Apply account_data filter to room account data
+    roomAccountData = applyEventFilter(roomAccountData, filter?.room?.account_data);
     joinedRoom.account_data!.events = roomAccountData;
 
     // Get read receipts for this room (from Room Durable Object)
@@ -316,21 +460,35 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       });
     }
 
+    // Apply ephemeral filter
+    joinedRoom.ephemeral!.events = applyEventFilter(
+      joinedRoom.ephemeral!.events,
+      filter?.room?.ephemeral
+    );
+
     response.rooms!.join![roomId] = joinedRoom;
   }
 
   // Get invited rooms
   const invitedRoomIds = await getUserRooms(c.env.DB, userId, 'invite');
   for (const roomId of invitedRoomIds) {
+    // Check if room should be included based on filter
+    if (!shouldIncludeRoom(roomId, filter?.room)) {
+      continue;
+    }
+
     const state = await getRoomState(c.env.DB, roomId);
 
     // Strip state for invited rooms
-    const strippedState = state.map(event => ({
+    let strippedState = state.map(event => ({
       type: event.type,
       state_key: event.state_key!,
       content: event.content,
       sender: event.sender,
     }));
+
+    // Apply state filter to invited room state
+    strippedState = applyEventFilter(strippedState, filter?.room?.state);
 
     const invitedRoom: InvitedRoom = {
       invite_state: {
@@ -342,9 +500,16 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Get left rooms (rooms user left since last sync)
-  if (sincePosition > 0) {
+  // Check if filter allows left rooms (default: false per spec)
+  const includeLeave = filter?.room?.include_leave ?? false;
+  if (sincePosition > 0 && (includeLeave || !filter)) {
     const leftRoomIds = await getUserRooms(c.env.DB, userId, 'leave');
     for (const roomId of leftRoomIds) {
+      // Check if room should be included based on filter
+      if (!shouldIncludeRoom(roomId, filter?.room)) {
+        continue;
+      }
+
       // Only include if membership changed since last sync
       const events = await getEventsSince(c.env.DB, roomId, sincePosition);
       const leaveEvent = events.find(

@@ -99,6 +99,13 @@ export async function generateLoginToken(): Promise<string> {
   return `mlt_${base64UrlEncode(bytes)}`;
 }
 
+// Generate a refresh token (for token refresh flow)
+export async function generateRefreshToken(): Promise<string> {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `syr_${base64UrlEncode(bytes)}`;
+}
+
 // Validate localpart (username)
 export function isValidLocalpart(localpart: string): boolean {
   // Matrix spec: lowercase letters, digits, and the characters .-_=/

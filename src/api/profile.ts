@@ -136,4 +136,123 @@ app.put('/_matrix/client/v3/profile/:userId/avatar_url', requireAuth(), async (c
   return c.json({});
 });
 
+// ============================================
+// Custom Profile Keys (Matrix v1.17 Extension)
+// ============================================
+
+// GET /_matrix/client/v3/profile/:userId/:keyName - Get custom profile key
+app.get('/_matrix/client/v3/profile/:userId/:keyName', optionalAuth(), async (c) => {
+  const targetUserId = decodeURIComponent(c.req.param('userId'));
+  const keyName = c.req.param('keyName');
+
+  // These are handled by the specific endpoints above
+  if (keyName === 'displayname' || keyName === 'avatar_url') {
+    // Let Hono route to the correct handler
+    // This shouldn't be reached due to route ordering, but defensive coding
+    return c.json({ errcode: 'M_UNRECOGNIZED', error: 'Use specific endpoint' }, 400);
+  }
+
+  const parsed = parseUserId(targetUserId);
+  if (!parsed) {
+    return Errors.invalidParam('user_id', 'Invalid user ID format').toResponse();
+  }
+
+  if (!isLocalServerName(parsed.serverName, c.env.SERVER_NAME)) {
+    return Errors.notFound('User not found').toResponse();
+  }
+
+  const user = await getUserById(c.env.DB, targetUserId);
+  if (!user) {
+    return Errors.notFound('User not found').toResponse();
+  }
+
+  // Get custom profile data from KV
+  const profileJson = await c.env.CACHE.get(`profile:${targetUserId}:custom`);
+  const profileData = profileJson ? JSON.parse(profileJson) : {};
+
+  if (!(keyName in profileData)) {
+    return Errors.notFound(`Profile key '${keyName}' not found`).toResponse();
+  }
+
+  return c.json({ [keyName]: profileData[keyName] });
+});
+
+// PUT /_matrix/client/v3/profile/:userId/:keyName - Set custom profile key
+app.put('/_matrix/client/v3/profile/:userId/:keyName', requireAuth(), async (c) => {
+  const authUserId = c.get('userId');
+  const targetUserId = decodeURIComponent(c.req.param('userId'));
+  const keyName = c.req.param('keyName');
+
+  // Cannot modify another user's profile
+  if (authUserId !== targetUserId) {
+    return Errors.forbidden('Cannot modify another user\'s profile').toResponse();
+  }
+
+  // Standard keys are handled by specific endpoints
+  if (keyName === 'displayname' || keyName === 'avatar_url') {
+    return c.json({ errcode: 'M_UNRECOGNIZED', error: 'Use specific endpoint' }, 400);
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const value = body[keyName];
+  if (value === undefined) {
+    return c.json({ errcode: 'M_MISSING_PARAM', error: `Missing '${keyName}' in request body` }, 400);
+  }
+
+  // Get current profile data from KV
+  const profileJson = await c.env.CACHE.get(`profile:${targetUserId}:custom`);
+  const profileData = profileJson ? JSON.parse(profileJson) : {};
+
+  // Update the key
+  profileData[keyName] = value;
+
+  // Store back in KV with 1-year TTL
+  await c.env.CACHE.put(
+    `profile:${targetUserId}:custom`,
+    JSON.stringify(profileData),
+    { expirationTtl: 365 * 24 * 60 * 60 }
+  );
+
+  return c.json({});
+});
+
+// DELETE /_matrix/client/v3/profile/:userId/:keyName - Delete custom profile key
+app.delete('/_matrix/client/v3/profile/:userId/:keyName', requireAuth(), async (c) => {
+  const authUserId = c.get('userId');
+  const targetUserId = decodeURIComponent(c.req.param('userId'));
+  const keyName = c.req.param('keyName');
+
+  // Cannot modify another user's profile
+  if (authUserId !== targetUserId) {
+    return Errors.forbidden('Cannot modify another user\'s profile').toResponse();
+  }
+
+  // Cannot delete standard keys
+  if (keyName === 'displayname' || keyName === 'avatar_url') {
+    return Errors.forbidden('Cannot delete standard profile keys').toResponse();
+  }
+
+  // Get current profile data from KV
+  const profileJson = await c.env.CACHE.get(`profile:${targetUserId}:custom`);
+  const profileData = profileJson ? JSON.parse(profileJson) : {};
+
+  // Remove the key
+  delete profileData[keyName];
+
+  // Store back in KV
+  await c.env.CACHE.put(
+    `profile:${targetUserId}:custom`,
+    JSON.stringify(profileData),
+    { expirationTtl: 365 * 24 * 60 * 60 }
+  );
+
+  return c.json({});
+});
+
 export default app;
