@@ -10,6 +10,12 @@ import { requireAuth } from '../middleware/auth';
 import { hashPassword, verifyPassword } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, deleteAllUserTokens } from '../services/database';
+import {
+  sendVerificationEmail,
+  createVerificationSession,
+  validateEmailToken,
+  getValidatedSession,
+} from '../services/email';
 
 const app = new Hono<AppEnv>();
 
@@ -207,11 +213,72 @@ app.get('/_matrix/client/v3/account/3pid', requireAuth(), async (c) => {
 
 // POST /_matrix/client/v3/account/3pid/add - Add 3PID (with UIA)
 app.post('/_matrix/client/v3/account/3pid/add', requireAuth(), async (c) => {
-  // 3PID management not fully supported
-  return c.json({
-    errcode: 'M_THREEPID_AUTH_FAILED',
-    error: 'Third-party identifier verification is not supported',
-  }, 400);
+  const userId = c.get('userId');
+  const db = c.env.DB;
+
+  let body: {
+    client_secret: string;
+    sid: string;
+    auth?: { type: string; session?: string };
+  };
+
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const { client_secret, sid, auth } = body;
+
+  if (!client_secret || !sid) {
+    return Errors.missingParam('client_secret and sid are required').toResponse();
+  }
+
+  // Require UIA for adding 3PID
+  if (!auth || auth.type !== 'm.login.password') {
+    const sessionId = await generateOpaqueId(16);
+    return c.json({
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: sessionId,
+    }, 401);
+  }
+
+  // Verify the session is validated
+  const validatedSession = await getValidatedSession(db, sid, client_secret);
+  if (!validatedSession) {
+    return c.json({
+      errcode: 'M_THREEPID_AUTH_FAILED',
+      error: 'Email verification not completed or session expired',
+    }, 400);
+  }
+
+  // Check if this email is already bound to another user
+  const existingBinding = await db.prepare(`
+    SELECT user_id FROM user_threepids
+    WHERE medium = 'email' AND address = ?
+  `).bind(validatedSession.email).first<{ user_id: string }>();
+
+  if (existingBinding && existingBinding.user_id !== userId) {
+    return c.json({
+      errcode: 'M_THREEPID_IN_USE',
+      error: 'This email is already associated with another account',
+    }, 400);
+  }
+
+  // Add the 3PID to the user's account
+  const now = Date.now();
+  await db.prepare(`
+    INSERT OR REPLACE INTO user_threepids (user_id, medium, address, validated_at, added_at)
+    VALUES (?, 'email', ?, ?, ?)
+  `).bind(userId, validatedSession.email, now, now).run();
+
+  // Clean up the verification session
+  await db.prepare(`
+    DELETE FROM email_verification_sessions WHERE session_id = ?
+  `).bind(sid).run();
+
+  return c.json({});
 });
 
 // POST /_matrix/client/v3/account/3pid/bind - Bind 3PID to identity server
@@ -258,10 +325,168 @@ app.post('/_matrix/client/v3/account/3pid/unbind', requireAuth(), async (c) => {
 
 // POST /_matrix/client/v3/account/3pid/email/requestToken - Request email verification
 app.post('/_matrix/client/v3/account/3pid/email/requestToken', async (c) => {
+  const db = c.env.DB;
+
+  let body: {
+    client_secret: string;
+    email: string;
+    send_attempt: number;
+    next_link?: string;
+    id_server?: string;
+    id_access_token?: string;
+  };
+
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const { client_secret, email, send_attempt } = body;
+
+  if (!client_secret) {
+    return Errors.missingParam('client_secret').toResponse();
+  }
+  if (!email) {
+    return Errors.missingParam('email').toResponse();
+  }
+  if (send_attempt === undefined) {
+    return Errors.missingParam('send_attempt').toResponse();
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return c.json({
+      errcode: 'M_INVALID_EMAIL',
+      error: 'Invalid email address format',
+    }, 400);
+  }
+
+  // Check if email is already bound to an account (for account 3PID addition)
+  const existingBinding = await db.prepare(`
+    SELECT user_id FROM user_threepids
+    WHERE medium = 'email' AND address = ?
+  `).bind(email).first<{ user_id: string }>();
+
+  if (existingBinding) {
+    return c.json({
+      errcode: 'M_THREEPID_IN_USE',
+      error: 'This email is already associated with an account',
+    }, 400);
+  }
+
+  // Create verification session
+  const result = await createVerificationSession(db, email, client_secret, send_attempt);
+
+  if ('error' in result) {
+    return c.json({
+      errcode: 'M_THREEPID_DENIED',
+      error: result.error,
+    }, 400);
+  }
+
+  // If token is empty, it's a retry of an existing session
+  if (result.token) {
+    // Send verification email
+    const emailResult = await sendVerificationEmail(
+      c.env,
+      email,
+      result.token,
+      c.env.SERVER_NAME
+    );
+
+    if (!emailResult.success) {
+      // Clean up session on email failure
+      await db.prepare(`
+        DELETE FROM email_verification_sessions WHERE session_id = ?
+      `).bind(result.sessionId).run();
+
+      return c.json({
+        errcode: 'M_THREEPID_DENIED',
+        error: emailResult.error || 'Failed to send verification email',
+      }, 500);
+    }
+  }
+
   return c.json({
-    errcode: 'M_THREEPID_DENIED',
-    error: 'Email verification is not supported',
-  }, 403);
+    sid: result.sessionId,
+  });
+});
+
+// POST /_matrix/client/v3/account/3pid/submit_token - Submit verification code (unofficial but widely used)
+// Some clients may also use GET for this endpoint
+app.post('/_matrix/client/v3/account/3pid/submit_token', async (c) => {
+  const db = c.env.DB;
+
+  let body: {
+    sid: string;
+    client_secret: string;
+    token: string;
+  };
+
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const { sid, client_secret, token } = body;
+
+  if (!sid) {
+    return Errors.missingParam('sid').toResponse();
+  }
+  if (!client_secret) {
+    return Errors.missingParam('client_secret').toResponse();
+  }
+  if (!token) {
+    return Errors.missingParam('token').toResponse();
+  }
+
+  const result = await validateEmailToken(db, sid, client_secret, token);
+
+  if (!result.success) {
+    return c.json({
+      errcode: 'M_THREEPID_AUTH_FAILED',
+      error: result.error || 'Verification failed',
+    }, 400);
+  }
+
+  return c.json({
+    success: true,
+  });
+});
+
+// GET /_matrix/client/v3/account/3pid/submit_token - Submit verification code (GET version)
+app.get('/_matrix/client/v3/account/3pid/submit_token', async (c) => {
+  const db = c.env.DB;
+
+  const sid = c.req.query('sid');
+  const client_secret = c.req.query('client_secret');
+  const token = c.req.query('token');
+
+  if (!sid) {
+    return Errors.missingParam('sid').toResponse();
+  }
+  if (!client_secret) {
+    return Errors.missingParam('client_secret').toResponse();
+  }
+  if (!token) {
+    return Errors.missingParam('token').toResponse();
+  }
+
+  const result = await validateEmailToken(db, sid, client_secret, token);
+
+  if (!result.success) {
+    return c.json({
+      errcode: 'M_THREEPID_AUTH_FAILED',
+      error: result.error || 'Verification failed',
+    }, 400);
+  }
+
+  return c.json({
+    success: true,
+  });
 });
 
 // POST /_matrix/client/v3/account/3pid/msisdn/requestToken - Request phone verification

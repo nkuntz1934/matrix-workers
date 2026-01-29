@@ -1320,4 +1320,74 @@ app.post('/admin/api/idp/providers/:id/test', requireAuth(), requireAdmin, async
   }
 });
 
+// ============================================
+// Matrix Client-Server Admin API Endpoints
+// ============================================
+
+// GET /_matrix/client/v3/admin/whois/:userId - Get information about a user's sessions
+// Per Matrix spec: admin users can query any user, non-admin users can only query themselves
+app.get('/_matrix/client/v3/admin/whois/:userId', requireAuth(), async (c) => {
+  const requestingUserId = c.get('userId');
+  const targetUserId = decodeURIComponent(c.req.param('userId'));
+  const db = c.env.DB;
+
+  // Check if requesting user is admin
+  const requestingUser = await getUserById(db, requestingUserId);
+  const isAdmin = Boolean(requestingUser?.admin);
+
+  // Non-admin users can only query themselves
+  if (!isAdmin && requestingUserId !== targetUserId) {
+    return Errors.forbidden('Admin privileges required to query other users').toResponse();
+  }
+
+  // Check if target user exists
+  const targetUser = await db.prepare(`
+    SELECT user_id FROM users WHERE user_id = ?
+  `).bind(targetUserId).first<{ user_id: string }>();
+
+  if (!targetUser) {
+    return Errors.notFound('User not found').toResponse();
+  }
+
+  // Get user's devices with session info
+  const devices = await db.prepare(`
+    SELECT d.device_id, d.display_name, d.last_seen_ts, d.last_seen_ip,
+           a.created_at as session_created_at
+    FROM devices d
+    LEFT JOIN access_tokens a ON d.user_id = a.user_id AND d.device_id = a.device_id
+    WHERE d.user_id = ?
+  `).bind(targetUserId).all<{
+    device_id: string;
+    display_name: string | null;
+    last_seen_ts: number | null;
+    last_seen_ip: string | null;
+    session_created_at: number | null;
+  }>();
+
+  // Build devices map in Matrix spec format
+  const devicesMap: Record<string, { sessions: Array<{
+    connections: Array<{
+      ip: string | null;
+      last_seen: number | null;
+      user_agent?: string;
+    }>;
+  }> }> = {};
+
+  for (const device of devices.results) {
+    devicesMap[device.device_id] = {
+      sessions: [{
+        connections: [{
+          ip: device.last_seen_ip || null,
+          last_seen: device.last_seen_ts || null,
+        }],
+      }],
+    };
+  }
+
+  return c.json({
+    user_id: targetUserId,
+    devices: devicesMap,
+  });
+});
+
 export default app;

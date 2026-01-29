@@ -173,7 +173,7 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
         enabled: true,
       },
       'm.3pid_changes': {
-        enabled: false,
+        enabled: true,
       },
     },
   });

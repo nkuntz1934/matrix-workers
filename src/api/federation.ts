@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, PDU } from '../types';
 import { Errors } from '../utils/errors';
-import { generateSigningKeyPair, signJson, sha256 } from '../utils/crypto';
+import { generateSigningKeyPair, signJson, sha256, verifySignature } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
   getRemoteKeysWithNotarySignature,
@@ -3006,13 +3006,319 @@ app.get('/_matrix/federation/v1/openid/userinfo', async (c) => {
 });
 
 // PUT /_matrix/federation/v1/exchange_third_party_invite/:roomId - Exchange 3PID invite
-// This is a low-priority endpoint for third-party identity invite exchange
-// Returning M_UNRECOGNIZED is acceptable per spec for servers that don't support 3PID invites
+// Handles third-party invites when a user accepts an invite via their verified email/phone
 app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) => {
-  return c.json({
-    errcode: 'M_UNRECOGNIZED',
-    error: 'Third party invites not supported',
-  }, 400);
+  const roomId = c.req.param('roomId');
+  const db = c.env.DB;
+  const serverName = c.env.SERVER_NAME;
+
+  let body: {
+    type: string;
+    room_id: string;
+    sender: string;
+    state_key: string;
+    content: {
+      membership: string;
+      third_party_invite?: {
+        display_name?: string;
+        signed: {
+          mxid: string;
+          token: string;
+          signatures: Record<string, Record<string, string>>;
+        };
+      };
+    };
+    origin_server_ts?: number;
+    depth?: number;
+    auth_events?: string[];
+    prev_events?: string[];
+    event_id?: string;
+    signatures?: Record<string, Record<string, string>>;
+  };
+
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  // Validate this is a membership invite
+  if (body.type !== 'm.room.member' || body.content?.membership !== 'invite') {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Event must be a membership invite',
+    }, 400);
+  }
+
+  // Validate room ID matches
+  if (body.room_id !== roomId) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Room ID mismatch',
+    }, 400);
+  }
+
+  // Validate third_party_invite is present
+  const thirdPartyInvite = body.content.third_party_invite;
+  if (!thirdPartyInvite || !thirdPartyInvite.signed) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Missing third_party_invite or signed data',
+    }, 400);
+  }
+
+  const { mxid, token, signatures } = thirdPartyInvite.signed;
+  if (!mxid || !token || !signatures) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Incomplete signed data in third_party_invite',
+    }, 400);
+  }
+
+  // Verify room exists
+  const room = await db.prepare(`
+    SELECT room_id, room_version FROM rooms WHERE room_id = ?
+  `).bind(roomId).first<{ room_id: string; room_version: string }>();
+
+  if (!room) {
+    return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Find the matching m.room.third_party_invite state event
+  const thirdPartyInviteEvent = await db.prepare(`
+    SELECT e.event_id, e.content, e.sender, e.state_key
+    FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.room.third_party_invite' AND rs.state_key = ?
+  `).bind(roomId, token).first<{
+    event_id: string;
+    content: string;
+    sender: string;
+    state_key: string;
+  }>();
+
+  if (!thirdPartyInviteEvent) {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'No third party invite found with matching token',
+    }, 403);
+  }
+
+  // Parse the third-party invite content to get the public keys
+  let inviteContent: {
+    display_name?: string;
+    key_validity_url?: string;
+    public_key?: string;
+    public_keys?: Array<{ public_key: string; key_validity_url?: string }>;
+  };
+
+  try {
+    inviteContent = JSON.parse(thirdPartyInviteEvent.content);
+  } catch {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'Invalid third party invite content',
+    }, 400);
+  }
+
+  // Verify the signature against the public keys in the invite
+  // The signed object format is: { mxid, sender, token, signatures }
+  // where sender is from the original third_party_invite event
+  const signedDataForVerification: Record<string, unknown> = {
+    mxid,
+    sender: thirdPartyInviteEvent.sender,
+    token,
+    signatures,
+  };
+
+  let signatureValid = false;
+  const publicKeys = inviteContent.public_keys || [];
+  if (inviteContent.public_key) {
+    publicKeys.push({ public_key: inviteContent.public_key });
+  }
+
+  // Try to verify with each public key
+  for (const keyInfo of publicKeys) {
+    const publicKey = keyInfo.public_key;
+    if (!publicKey) continue;
+
+    // Look for a signature from the identity server
+    // Signatures are keyed by server name (typically the identity server)
+    for (const [signingServer, keySignatures] of Object.entries(signatures)) {
+      for (const [keyId, signature] of Object.entries(keySignatures)) {
+        if (!signature) continue;
+
+        try {
+          // Verify the Ed25519 signature using the public key from the invite
+          const isValid = await verifySignature(
+            signedDataForVerification,
+            signingServer,
+            keyId,
+            publicKey
+          );
+
+          if (isValid) {
+            signatureValid = true;
+            break;
+          }
+        } catch (e) {
+          console.warn(`Failed to verify signature from ${signingServer}:${keyId}:`, e);
+        }
+      }
+      if (signatureValid) break;
+    }
+    if (signatureValid) break;
+  }
+
+  if (!signatureValid) {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Could not verify third party invite signature',
+    }, 403);
+  }
+
+  // Verify the mxid matches the state_key
+  if (mxid !== body.state_key) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'mxid does not match state_key',
+    }, 400);
+  }
+
+  // Get our signing key
+  const key = await db.prepare(
+    `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 2`
+  ).first<{ key_id: string; private_key_jwk: string | null }>();
+
+  if (!key || !key.private_key_jwk) {
+    return c.json({
+      errcode: 'M_UNKNOWN',
+      error: 'Server signing key not configured',
+    }, 500);
+  }
+
+  // Get auth events for the invite
+  const createEvent = await db.prepare(`
+    SELECT e.event_id FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'
+  `).bind(roomId).first<{ event_id: string }>();
+
+  const joinRulesEvent = await db.prepare(`
+    SELECT e.event_id FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.room.join_rules'
+  `).bind(roomId).first<{ event_id: string }>();
+
+  const powerLevelsEvent = await db.prepare(`
+    SELECT e.event_id FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'
+  `).bind(roomId).first<{ event_id: string }>();
+
+  const senderMembershipEvent = await db.prepare(`
+    SELECT e.event_id FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = 'm.room.member' AND rs.state_key = ?
+  `).bind(roomId, body.sender).first<{ event_id: string }>();
+
+  const authEvents: string[] = [];
+  if (createEvent) authEvents.push(createEvent.event_id);
+  if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
+  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  if (senderMembershipEvent) authEvents.push(senderMembershipEvent.event_id);
+  authEvents.push(thirdPartyInviteEvent.event_id);
+
+  // Get latest event for prev_events
+  const latestEvent = await db.prepare(
+    `SELECT event_id, depth FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1`
+  ).bind(roomId).first<{ event_id: string; depth: number }>();
+
+  const prevEvents = latestEvent ? [latestEvent.event_id] : [];
+  const depth = (latestEvent?.depth || 0) + 1;
+  const originServerTs = Date.now();
+
+  // Create the invite event
+  const inviteEvent = {
+    room_id: roomId,
+    sender: body.sender,
+    type: 'm.room.member',
+    state_key: mxid,
+    content: {
+      membership: 'invite',
+      third_party_invite: {
+        display_name: inviteContent.display_name || thirdPartyInvite.display_name,
+        signed: thirdPartyInvite.signed,
+      },
+    },
+    origin_server_ts: originServerTs,
+    depth,
+    auth_events: authEvents,
+    prev_events: prevEvents,
+  };
+
+  // Calculate event ID (for room versions 1-3, event_id is computed differently)
+  // For room versions 4+, event_id is computed from the content hash
+  const eventIdHash = await sha256(JSON.stringify({
+    ...inviteEvent,
+    origin: serverName,
+  }));
+  const eventId = body.event_id || `$${eventIdHash}`;
+
+  // Sign the event
+  const signedEvent = await signJson(
+    { ...inviteEvent, event_id: eventId },
+    serverName,
+    key.key_id,
+    JSON.parse(key.private_key_jwk)
+  );
+
+  // Store the event
+  try {
+    await db.prepare(`
+      INSERT OR IGNORE INTO events
+      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, signatures)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      eventId,
+      roomId,
+      body.sender,
+      'm.room.member',
+      mxid,
+      JSON.stringify(inviteEvent.content),
+      originServerTs,
+      depth,
+      JSON.stringify(authEvents),
+      JSON.stringify(prevEvents),
+      JSON.stringify((signedEvent as any).signatures)
+    ).run();
+
+    // Update room state
+    await db.prepare(`
+      INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+      VALUES (?, 'm.room.member', ?, ?)
+    `).bind(roomId, mxid, eventId).run();
+
+    // Update memberships table
+    await db.prepare(`
+      INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id, display_name)
+      VALUES (?, ?, 'invite', ?, ?)
+    `).bind(roomId, mxid, eventId, inviteContent.display_name || null).run();
+
+    // Delete the third party invite state event (it's been consumed)
+    await db.prepare(`
+      DELETE FROM room_state
+      WHERE room_id = ? AND event_type = 'm.room.third_party_invite' AND state_key = ?
+    `).bind(roomId, token).run();
+  } catch (e) {
+    console.error('Failed to store third party invite exchange event:', e);
+    return c.json({
+      errcode: 'M_UNKNOWN',
+      error: 'Failed to store invite event',
+    }, 500);
+  }
+
+  return c.json({});
 });
 
 export default app;

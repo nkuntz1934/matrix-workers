@@ -69,6 +69,10 @@ export interface Env {
   // Cloudflare Workflows for durable multi-step operations
   ROOM_JOIN_WORKFLOW: Workflow;
   PUSH_NOTIFICATION_WORKFLOW: Workflow;
+
+  // Email Service Configuration (Resend)
+  RESEND_API_KEY?: string;   // Resend API key for email verification
+  EMAIL_FROM?: string;       // From address for verification emails (e.g., "noreply@m.example.com")
 }
 
 // Variables set by middleware and available via c.get()

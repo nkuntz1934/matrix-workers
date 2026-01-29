@@ -1862,6 +1862,82 @@ app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
 });
 
 // ============================================
+// Timestamp to Event (MSC3030)
+// ============================================
+
+// GET /_matrix/client/v3/rooms/:roomId/timestamp_to_event
+// Finds the closest event to a given timestamp
+app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const roomId = c.req.param('roomId');
+  const db = c.env.DB;
+
+  // Parse required parameters
+  const tsParam = c.req.query('ts');
+  const dirParam = c.req.query('dir');
+
+  if (!tsParam) {
+    return Errors.missingParam('ts').toResponse();
+  }
+  if (!dirParam) {
+    return Errors.missingParam('dir').toResponse();
+  }
+
+  const ts = parseInt(tsParam, 10);
+  if (isNaN(ts)) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'ts must be a valid integer timestamp in milliseconds',
+    }, 400);
+  }
+
+  if (dirParam !== 'f' && dirParam !== 'b') {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: "dir must be 'f' (forward) or 'b' (backward)",
+    }, 400);
+  }
+
+  // Check membership - user must be joined to the room
+  const membership = await getMembership(db, roomId, userId);
+  if (!membership || membership.membership !== 'join') {
+    return Errors.forbidden('Not a member of this room').toResponse();
+  }
+
+  // Query for the closest event
+  let event: { event_id: string; origin_server_ts: number } | null = null;
+
+  if (dirParam === 'f') {
+    // Forward: find the closest event at or after the timestamp
+    event = await db.prepare(`
+      SELECT event_id, origin_server_ts
+      FROM events
+      WHERE room_id = ? AND origin_server_ts >= ?
+      ORDER BY origin_server_ts ASC
+      LIMIT 1
+    `).bind(roomId, ts).first<{ event_id: string; origin_server_ts: number }>();
+  } else {
+    // Backward: find the closest event at or before the timestamp
+    event = await db.prepare(`
+      SELECT event_id, origin_server_ts
+      FROM events
+      WHERE room_id = ? AND origin_server_ts <= ?
+      ORDER BY origin_server_ts DESC
+      LIMIT 1
+    `).bind(roomId, ts).first<{ event_id: string; origin_server_ts: number }>();
+  }
+
+  if (!event) {
+    return Errors.notFound('No event found for the given timestamp').toResponse();
+  }
+
+  return c.json({
+    event_id: event.event_id,
+    origin_server_ts: event.origin_server_ts,
+  });
+});
+
+// ============================================
 // Room Upgrade
 // ============================================
 

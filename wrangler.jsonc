@@ -135,6 +135,10 @@
   // npx wrangler secret put CALLS_APP_SECRET
   // npx wrangler secret put LIVEKIT_API_SECRET
   //
+  // For email verification (3PID) via Resend:
+  // npx wrangler secret put RESEND_API_KEY   # API key from resend.com
+  // npx wrangler secret put EMAIL_FROM       # From address (e.g., "noreply@m.easydemo.org")
+  //
   // For direct APNs push notifications (optional - bypasses Sygnal):
   // npx wrangler secret put APNS_KEY_ID      # Key ID from Apple Developer Portal
   // npx wrangler secret put APNS_TEAM_ID     # Apple Developer Team ID

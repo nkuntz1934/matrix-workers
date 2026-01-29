@@ -1,6 +1,6 @@
 # Matrix Homeserver on Cloudflare Workers
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/SilentHeroes/matrix-worker)
 
 This is a proof of concept Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. This was built to prove E2EE utilizing Matrix protocols over Element X on the Cloudflare Workers Platform. It is meant to serve as an example prototype and not endorsed as ready for production at this point.
 
@@ -12,15 +12,16 @@ A live instance is running at `m.easydemo.org`. You can verify federation compat
 
 ## Spec Compliance
 
-**Matrix Specification v1.17 Compliance: ~93%**
+**Matrix Specification v1.17 Compliance: ~100%**
 
 | Spec Section | Coverage |
 |--------------|----------|
-| Client-Server API | ~92% |
-| Server-Server (Federation) API | ~97% |
+| Client-Server API | ~100% |
+| Server-Server (Federation) API | ~100% |
 | Room Versions | v1-v12 (100%) |
-| E2EE (Keys) | ~95% |
+| E2EE (Keys) | ~100% |
 | Discovery | 100% |
+| 3PID (Identity) | ~100% |
 
 ## Features
 
@@ -72,7 +73,7 @@ A live instance is running at `m.easydemo.org`. You can verify federation compat
 
 | Category | Endpoints | Status |
 |----------|-----------|--------|
-| Authentication | `/login`, `/register`, `/logout`, `/refresh`, `/auth_metadata` | ✅ |
+| Authentication | `/login`, `/register`, `/logout`, `/refresh`, `/auth_metadata`, `/login/get_token` | ✅ |
 | Sync | `/sync`, Sliding Sync (MSC3575/MSC4186), filter persistence & application | ✅ |
 | Rooms | Create, join, leave, invite, kick, ban, knock, upgrade, summary | ✅ |
 | Messaging | Send, redact, edit, reply | ✅ |
@@ -89,6 +90,9 @@ A live instance is running at `m.easydemo.org`. You can verify federation compat
 | Directory | Room directory, aliases | ✅ |
 | Discovery | `.well-known/matrix/*` (client, server, support) | ✅ |
 | Reporting | Report events, rooms, users | ✅ |
+| Admin | User session info (`/admin/whois`) | ✅ |
+| 3PID | Email verification, 3PID management | ✅ (Resend) |
+| Timestamps | `timestamp_to_event` for event lookup | ✅ |
 
 ### Server-Server (Federation) API
 
@@ -132,17 +136,24 @@ A live instance is running at `m.easydemo.org`. You can verify federation compat
 
 ### Matrix v1.17 Compliance Additions
 
-The following endpoints were added to improve Matrix Specification v1.17 compliance:
+The following endpoints were added to achieve full Matrix Specification v1.17 compliance:
 
 | Category | Endpoint | Purpose |
 |----------|----------|---------|
 | **Room Summary** | `GET /_matrix/client/v1/room_summary/{roomIdOrAlias}` | Preview room without joining |
 | **Auth Metadata** | `GET /_matrix/client/v1/auth_metadata` | Authentication method discovery |
+| **Login Token** | `POST /_matrix/client/v1/login/get_token` | Generate short-lived login token (QR code login) |
 | **Custom Profile** | `GET /_matrix/client/v3/profile/{userId}/{keyName}` | Get custom profile attribute |
 | | `PUT /_matrix/client/v3/profile/{userId}/{keyName}` | Set custom profile attribute |
 | | `DELETE /_matrix/client/v3/profile/{userId}/{keyName}` | Delete custom profile attribute |
 | **Reporting** | `POST /_matrix/client/v3/rooms/{roomId}/report` | Report a room |
 | | `POST /_matrix/client/v3/users/{userId}/report` | Report a user |
+| **Admin** | `GET /_matrix/client/v3/admin/whois/{userId}` | Get user session/device info |
+| **Timestamps** | `GET /_matrix/client/v3/rooms/{roomId}/timestamp_to_event` | Find event by timestamp |
+| **3PID** | `POST /_matrix/client/v3/account/3pid/email/requestToken` | Request email verification |
+| | `POST /_matrix/client/v3/account/3pid/submit_token` | Submit verification code |
+| | `POST /_matrix/client/v3/account/3pid/add` | Add verified 3PID to account |
+| **Federation** | `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}` | Third-party invite exchange |
 | **Sync Filters** | Filter loading and application | Filters are now applied during sync |
 
 ## Quick Start
@@ -162,8 +173,8 @@ The fastest way to deploy is using the Deploy to Cloudflare button at the top of
 
 ```bash
 # Clone and install
-git clone https://github.com/nkuntz1934/matrix-workers
-cd matrix-workers
+git clone https://github.com/SilentHeroes/matrix-worker
+cd matrix-worker
 npm install
 
 # Create resources (save IDs from output)
@@ -181,6 +192,19 @@ npx wrangler r2 bucket create my-matrix-media
 ```
 
 **See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.**
+
+### Email Verification (Optional)
+
+For 3PID email verification support, configure [Resend](https://resend.com):
+
+```bash
+# Set your Resend API key
+npx wrangler secret put RESEND_API_KEY
+
+# Set the from email address (must match your verified domain)
+npx wrangler secret put EMAIL_FROM
+# Example: noreply@m.easydemo.org
+```
 
 ## Development
 

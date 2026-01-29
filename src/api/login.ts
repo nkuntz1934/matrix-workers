@@ -413,6 +413,41 @@ app.post('/_matrix/client/v3/register', async (c) => {
   });
 });
 
+// POST /_matrix/client/v1/login/get_token - Generate a login token for authenticated user
+// Per Matrix spec: generates a short-lived login token for QR code login and similar flows
+app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+
+  // Generate a login token
+  const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
+  const loginToken = btoa(String.fromCharCode(...tokenBytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+
+  // Token is valid for 2 minutes (per Matrix spec recommendation)
+  const expiresInMs = 2 * 60 * 1000;
+  const expiresAt = Date.now() + expiresInMs;
+
+  // Store the token in KV with TTL
+  const tokenHash = await hashToken(loginToken);
+  await c.env.SESSIONS.put(
+    `login_token:${tokenHash}`,
+    JSON.stringify({
+      user_id: userId,
+      expires_at: expiresAt,
+    }),
+    {
+      expirationTtl: 120, // 2 minutes in seconds
+    }
+  );
+
+  return c.json({
+    login_token: loginToken,
+    expires_in_ms: expiresInMs,
+  });
+});
+
 // GET /_matrix/client/v3/account/whoami - Get current user info
 app.get('/_matrix/client/v3/account/whoami', requireAuth(), async (c) => {
   const userId = c.get('userId');
