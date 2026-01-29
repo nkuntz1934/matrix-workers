@@ -595,17 +595,24 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
     const params: Record<string, any> = {};
     
     if (userIsOIDC) {
-      // OIDC users: Use m.login.oauth per MSC3861/MSC2967
-      // The Matrix Rust SDK (used by Element X) expects this specific format
-      flows.push({ stages: ['m.login.oauth'] });
+      // OIDC users: Use org.matrix.cross_signing_reset per MSC4312
+      // This is the unstable identifier; stable is m.oauth
+      // Per MSC4312: "To prevent breaking clients that have implemented the unstable identifier,
+      // servers SHOULD offer two flows (one with each of m.oauth and org.matrix.cross_signing_reset)"
+      const unstableStage = 'org.matrix.cross_signing_reset';
+      const stableStage = 'm.oauth';
       
-      // Provide OAuth approval URL for the client
-      // Element X will open this URL and wait for approval
-      params['m.login.oauth'] = {
-        // The URL where the user can approve the cross-signing reset
-        // This follows the format expected by matrix-rust-sdk
-        url: `${baseUrl}/oauth/authorize/uia?session=${sessionId}&action=org.matrix.cross_signing_reset`,
-      };
+      // Offer both flows for compatibility during migration
+      flows.push({ stages: [unstableStage] });
+      flows.push({ stages: [stableStage] });
+      
+      // The URL points to authorization server's account management UI
+      // where the user can approve the cross-signing reset
+      const approvalUrl = `${baseUrl}/oauth/authorize/uia?session=${sessionId}&action=org.matrix.cross_signing_reset`;
+      
+      // Both stages use the same params with 'url' pointing to approval page
+      params[unstableStage] = { url: approvalUrl };
+      params[stableStage] = { url: approvalUrl };
     }
     
     if (userHasPassword) {
@@ -664,12 +671,19 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
       }
 
       console.log('[keys] Password validated successfully');
-    } else if (auth.type === 'm.login.oauth' || auth.type === 'm.login.sso' || auth.type === 'm.login.token') {
-      // OAuth/SSO/Token authentication for OIDC users
-      // Check if this session has been completed via OAuth/SSO flow
+    } else if (auth.type === 'org.matrix.cross_signing_reset' || auth.type === 'm.oauth' ||
+               auth.type === 'm.login.oauth' || auth.type === 'm.login.sso' || auth.type === 'm.login.token' ||
+               !auth.type) {
+      // MSC4312 cross-signing reset flow for OIDC users
+      // Supports:
+      // - org.matrix.cross_signing_reset (unstable per MSC4312)
+      // - m.oauth (stable per MSC4312)
+      // - m.login.oauth, m.login.sso, m.login.token (legacy compatibility)
+      // - No type at all (per MSC4312: client just sends session)
+      
       const sessionId = auth.session;
       if (!sessionId) {
-        console.log('[keys] No session ID in OAuth/SSO auth');
+        console.log('[keys] No session ID in OAuth/cross-signing auth');
         return Errors.missingParam('auth.session').toResponse();
       }
 
@@ -690,18 +704,24 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
         return Errors.forbidden('Session user mismatch').toResponse();
       }
 
-      // Check if OAuth/SSO has been completed for this session
-      if (!session.completed_stages.includes('m.login.oauth') && 
-          !session.completed_stages.includes('m.login.sso') && 
-          !session.completed_stages.includes('m.login.token')) {
-        console.log('[keys] OAuth/SSO not completed for this session');
+      // Check if the cross-signing reset has been approved via OAuth flow
+      // Accept any of the stage names that indicate completion
+      const completedStages = session.completed_stages || [];
+      const hasOAuthApproval = completedStages.includes('org.matrix.cross_signing_reset') ||
+                              completedStages.includes('m.oauth') ||
+                              completedStages.includes('m.login.oauth') ||
+                              completedStages.includes('m.login.sso') ||
+                              completedStages.includes('m.login.token');
+      
+      if (!hasOAuthApproval) {
+        console.log('[keys] Cross-signing reset not approved for this session');
         return c.json({
           errcode: 'M_UNAUTHORIZED',
-          error: 'OAuth authentication not completed. Please approve the request.',
+          error: 'Cross-signing reset not approved. Please approve the request at the provided URL.',
         }, 401);
       }
 
-      console.log('[keys] OAuth/SSO/Token authentication validated successfully');
+      console.log('[keys] Cross-signing reset approved via OAuth flow');
       
       // Clean up the session
       await c.env.CACHE.delete(`uia_session:${sessionId}`);

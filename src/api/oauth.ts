@@ -982,10 +982,15 @@ app.post('/oauth/authorize/uia', async (c) => {
     ));
   }
 
-  // Mark the OAuth stage as completed
+  // Mark the cross-signing reset as approved per MSC4312
+  // Use org.matrix.cross_signing_reset (unstable) as the primary marker
+  // Also mark m.oauth (stable) and legacy m.login.oauth for compatibility
   session.completed_stages = session.completed_stages || [];
-  if (!session.completed_stages.includes('m.login.oauth')) {
-    session.completed_stages.push('m.login.oauth');
+  const stagesToMark = ['org.matrix.cross_signing_reset', 'm.oauth', 'm.login.oauth'];
+  for (const stage of stagesToMark) {
+    if (!session.completed_stages.includes(stage)) {
+      session.completed_stages.push(stage);
+    }
   }
   session.oauth_completed_at = Date.now();
 
