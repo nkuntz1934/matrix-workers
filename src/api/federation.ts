@@ -13,6 +13,8 @@ import {
   validateSendJoinAuthChain,
 } from '../services/authorization';
 import { validatePdu } from '../services/event-validation';
+import { resolveStateWithNewEvent } from '../services/state-resolution';
+import { storeEvent, getRoomState } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -195,7 +197,32 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // TODO: State resolution will be added in Phase 7
+      // State resolution for state events
+      if (pdu.state_key !== undefined) {
+        // Get current room state for resolution
+        const currentState = await getRoomState(c.env.DB, pdu.room_id);
+
+        // Resolve state with the new event
+        const resolutionResult = await resolveStateWithNewEvent(pdu, currentState, authEvents);
+
+        if (resolutionResult.hadConflicts) {
+          // Check if the new event won the resolution
+          const newEventWon = resolutionResult.resolvedState.some(
+            (e) => e.event_id === pdu.event_id
+          );
+
+          if (!newEventWon) {
+            // New event lost state resolution - still store it but log
+            console.log(
+              `[STATE_RESOLUTION] Event ${pdu.event_id} lost state resolution for ` +
+              `${pdu.type}/${pdu.state_key} in room ${pdu.room_id}`
+            );
+          }
+        }
+      }
+
+      // Store the event
+      await storeEvent(c.env.DB, pdu);
       pduResults[pdu.event_id] = {};
     } catch (e: any) {
       pduResults[pdu.event_id] = {
