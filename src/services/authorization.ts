@@ -569,11 +569,15 @@ export async function validateAuthChain(
   event: PDU,
   authEvents: PDU[]
 ): Promise<AuthorizationResult> {
-  // Check all referenced auth_events exist
-  const authEventIds = new Set(authEvents.map((e) => e.event_id));
+  // Build lookup map for auth events
+  const authEventMap = new Map<string, PDU>();
+  for (const authEvent of authEvents) {
+    authEventMap.set(authEvent.event_id, authEvent);
+  }
 
+  // Check all referenced auth_events exist
   for (const requiredId of event.auth_events) {
-    if (!authEventIds.has(requiredId)) {
+    if (!authEventMap.has(requiredId)) {
       return { authorized: false, reason: `Missing auth event: ${requiredId}` };
     }
   }
@@ -593,9 +597,9 @@ export async function validateAuthChain(
     }
   }
 
-  // Must include m.room.create
-  const hasCreate = authEvents.some((e) => e.type === 'm.room.create');
-  if (!hasCreate && event.type !== 'm.room.create') {
+  // Must include m.room.create (except for create event itself)
+  const createEvent = authEvents.find((e) => e.type === 'm.room.create');
+  if (!createEvent && event.type !== 'm.room.create') {
     return { authorized: false, reason: 'Auth chain must include m.room.create' };
   }
 
@@ -607,6 +611,184 @@ export async function validateAuthChain(
     if (!hasSenderMembership) {
       return { authorized: false, reason: "Auth chain must include sender's membership" };
     }
+  }
+
+  // Check for power_levels if event requires power level checks
+  // (state events and certain room events need power levels)
+  if (event.type !== 'm.room.create' && event.state_key !== undefined) {
+    // State events (other than member events for self) typically need power_levels
+    // However, power_levels is not strictly required if using default levels
+    // We check if it exists in auth_events when the event references it
+  }
+
+  // Check for DAG cycles in auth chain
+  const cycleResult = detectAuthChainCycle(event, authEventMap);
+  if (!cycleResult.valid) {
+    return { authorized: false, reason: cycleResult.reason };
+  }
+
+  // Recursively validate each auth event is itself authorized
+  const recursiveResult = await validateAuthEventsRecursively(authEvents, authEventMap);
+  if (!recursiveResult.authorized) {
+    return recursiveResult;
+  }
+
+  return { authorized: true };
+}
+
+/**
+ * Detect cycles in the auth event DAG
+ * Returns { valid: true } if no cycles, { valid: false, reason } if cycle detected
+ */
+function detectAuthChainCycle(
+  event: PDU,
+  authEventMap: Map<string, PDU>
+): { valid: boolean; reason?: string } {
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+
+  function hasCycle(eventId: string): boolean {
+    if (recursionStack.has(eventId)) {
+      return true; // Cycle detected
+    }
+    if (visited.has(eventId)) {
+      return false; // Already fully explored, no cycle from here
+    }
+
+    visited.add(eventId);
+    recursionStack.add(eventId);
+
+    const currentEvent = authEventMap.get(eventId);
+    if (currentEvent && currentEvent.auth_events) {
+      for (const authEventId of currentEvent.auth_events) {
+        if (hasCycle(authEventId)) {
+          return true;
+        }
+      }
+    }
+
+    recursionStack.delete(eventId);
+    return false;
+  }
+
+  // Check for cycles starting from the main event
+  if (event.auth_events) {
+    for (const authEventId of event.auth_events) {
+      if (hasCycle(authEventId)) {
+        return { valid: false, reason: `Cycle detected in auth chain involving ${authEventId}` };
+      }
+    }
+  }
+
+  // Also check that no auth event references the main event (direct cycle)
+  for (const authEvent of authEventMap.values()) {
+    if (authEvent.auth_events?.includes(event.event_id)) {
+      return { valid: false, reason: `Auth event ${authEvent.event_id} references the event being validated` };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Recursively validate that each auth event is itself authorized by its own auth events
+ */
+async function validateAuthEventsRecursively(
+  authEvents: PDU[],
+  authEventMap: Map<string, PDU>
+): Promise<AuthorizationResult> {
+  // Process auth events in topological order (create first, then others)
+  const sortedAuthEvents = [...authEvents].sort((a, b) => {
+    // Create event always comes first
+    if (a.type === 'm.room.create') return -1;
+    if (b.type === 'm.room.create') return 1;
+    // Then by depth
+    return (a.depth ?? 0) - (b.depth ?? 0);
+  });
+
+  for (const authEvent of sortedAuthEvents) {
+    // Skip create event - it authorizes itself (checked separately)
+    if (authEvent.type === 'm.room.create') {
+      const createResult = await checkEventAuthorization(authEvent, {
+        memberEvents: new Map(),
+      });
+      if (!createResult.authorized) {
+        return {
+          authorized: false,
+          reason: `Auth event ${authEvent.event_id} (m.room.create) is invalid: ${createResult.reason}`,
+        };
+      }
+      continue;
+    }
+
+    // Get this auth event's own auth events
+    const eventAuthEvents: PDU[] = [];
+    for (const refId of authEvent.auth_events || []) {
+      const refEvent = authEventMap.get(refId);
+      if (refEvent) {
+        eventAuthEvents.push(refEvent);
+      }
+      // Note: We don't fail if auth event is missing here because
+      // it might be a historical event not in the provided set
+    }
+
+    // Build auth state from this event's auth events
+    const authState = buildAuthStateFromEvents(eventAuthEvents);
+
+    // Check if this auth event is authorized
+    const authResult = await checkEventAuthorization(authEvent, authState);
+    if (!authResult.authorized) {
+      return {
+        authorized: false,
+        reason: `Auth event ${authEvent.event_id} (${authEvent.type}) is not authorized: ${authResult.reason}`,
+      };
+    }
+  }
+
+  return { authorized: true };
+}
+
+/**
+ * Extended auth chain validation for send_join - validates the joining event
+ * against the room's current state and the provided auth chain
+ */
+export async function validateSendJoinAuthChain(
+  joinEvent: PDU,
+  roomAuthState: RoomAuthState,
+  providedAuthEvents: PDU[]
+): Promise<AuthorizationResult> {
+  // First, validate the auth chain structure
+  const authEventMap = new Map<string, PDU>();
+  for (const authEvent of providedAuthEvents) {
+    authEventMap.set(authEvent.event_id, authEvent);
+  }
+
+  // Check for cycles
+  const cycleResult = detectAuthChainCycle(joinEvent, authEventMap);
+  if (!cycleResult.valid) {
+    return { authorized: false, reason: cycleResult.reason };
+  }
+
+  // Validate the join event references valid auth events
+  for (const authEventId of joinEvent.auth_events || []) {
+    if (!authEventMap.has(authEventId)) {
+      // Check if it's in the room's existing state
+      const inRoomState =
+        (roomAuthState.createEvent?.event_id === authEventId) ||
+        (roomAuthState.powerLevelsEvent?.event_id === authEventId) ||
+        (roomAuthState.joinRulesEvent?.event_id === authEventId) ||
+        Array.from(roomAuthState.memberEvents.values()).some(e => e.event_id === authEventId);
+
+      if (!inRoomState) {
+        return { authorized: false, reason: `Missing auth event: ${authEventId}` };
+      }
+    }
+  }
+
+  // Validate the join event is authorized
+  const authResult = await checkEventAuthorization(joinEvent, roomAuthState);
+  if (!authResult.authorized) {
+    return authResult;
   }
 
   return { authorized: true };

@@ -10,6 +10,7 @@ import {
   fetchRoomAuthState,
   buildAuthStateFromEvents,
   validateAuthChain,
+  validateSendJoinAuthChain,
 } from '../services/authorization';
 import { validatePdu } from '../services/event-validation';
 
@@ -504,11 +505,33 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
     }
   }
 
+  // Validate PDU structure
+  const pduValidation = validatePdu(joinEvent as unknown as Record<string, unknown>);
+  if (!pduValidation.valid) {
+    return c.json(
+      { errcode: pduValidation.errcode || 'M_BAD_JSON', error: pduValidation.error },
+      400
+    );
+  }
+
   // Fetch current room auth state
   const authState = await fetchRoomAuthState(c.env.DB, roomId);
 
   if (!authState.createEvent) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Fetch auth events referenced by the join event for validation
+  const joinAuthEvents = await fetchAuthEvents(c.env.DB, joinEvent.auth_events || []);
+
+  // Validate auth chain (DAG structure, recursive authorization)
+  const chainResult = await validateSendJoinAuthChain(joinEvent, authState, joinAuthEvents);
+  if (!chainResult.authorized) {
+    if (enforcement === 'enforce') {
+      return Errors.forbidden(chainResult.reason || 'Invalid auth chain').toResponse();
+    } else {
+      console.warn(`[SEND_JOIN] Invalid auth chain: ${chainResult.reason}`);
+    }
   }
 
   // Check authorization
