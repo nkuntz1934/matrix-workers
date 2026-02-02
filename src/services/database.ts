@@ -2,6 +2,7 @@
 
 import type { User, Device, Room, PDU, Membership, Env } from '../types';
 import { applyRedactionsToEvents } from './redaction';
+import { calculateContentHash } from '../utils/crypto';
 
 // User operations
 export async function createUser(
@@ -261,6 +262,13 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
 
   const streamOrdering = (lastOrdering?.max_ordering ?? 0) + 1;
 
+  // Compute content hash if not already present (for locally-created events)
+  let hashes = event.hashes;
+  if (!hashes) {
+    const contentHash = await calculateContentHash(event as unknown as Record<string, unknown>);
+    hashes = { sha256: contentHash };
+  }
+
   await db.prepare(
     `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
      origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
@@ -277,7 +285,7 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     event.depth,
     JSON.stringify(event.auth_events),
     JSON.stringify(event.prev_events),
-    event.hashes ? JSON.stringify(event.hashes) : null,
+    JSON.stringify(hashes),
     event.signatures ? JSON.stringify(event.signatures) : null,
     streamOrdering
   ).run();

@@ -443,23 +443,52 @@ export function canonicalJson(obj: unknown): string {
   return 'null';
 }
 
-// Calculate content hash for PDU
-export async function calculateContentHash(content: Record<string, unknown>): Promise<string> {
-  // Remove signatures and unsigned before hashing
-  const toHash = { ...content };
+/**
+ * Calculate content hash for a Matrix event/PDU.
+ * Per Matrix spec, this is SHA-256 of the canonical JSON with
+ * 'signatures', 'unsigned', and 'hashes' fields removed.
+ *
+ * @param event - The event object
+ * @returns The SHA-256 hash as unpadded base64
+ */
+export async function calculateContentHash(event: Record<string, unknown>): Promise<string> {
+  // Remove signatures, unsigned, and hashes before hashing (per spec)
+  const toHash = { ...event };
   delete toHash['signatures'];
   delete toHash['unsigned'];
+  delete toHash['hashes'];
 
   const canonical = canonicalJson(toHash);
-  return sha256(canonical);
+
+  // Compute SHA-256 and return as unpadded base64 (not URL-safe)
+  const encoder = new TextEncoder();
+  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(canonical));
+  return bytesToUnpadBase64(new Uint8Array(hash));
+}
+
+/**
+ * Add the hashes field to an event.
+ * Call this when creating events before signing.
+ *
+ * @param event - The event object (without hashes)
+ * @returns The event with hashes.sha256 added
+ */
+export async function addEventHash<T extends Record<string, unknown>>(
+  event: T
+): Promise<T & { hashes: { sha256: string } }> {
+  const contentHash = await calculateContentHash(event);
+  return {
+    ...event,
+    hashes: { sha256: contentHash },
+  };
 }
 
 // Verify content hash
 export async function verifyContentHash(
-  content: Record<string, unknown>,
+  event: Record<string, unknown>,
   expectedHash: string
 ): Promise<boolean> {
-  const actualHash = await calculateContentHash(content);
+  const actualHash = await calculateContentHash(event);
   return actualHash === expectedHash;
 }
 
