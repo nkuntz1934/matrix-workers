@@ -281,6 +281,137 @@ export function validateMemberContent(content: Record<string, unknown>): Validat
     }
   }
 
+  // reason - if present, should be a string (used for kicks, bans, etc.)
+  if (content.reason !== undefined && content.reason !== null) {
+    if (typeof content.reason !== 'string') {
+      return {
+        valid: false,
+        error: 'reason must be a string',
+        errcode: 'M_BAD_JSON',
+      };
+    }
+  }
+
+  // join_authorised_via_users_server - if present, must be valid user ID
+  // Used when joining via restricted join rules
+  if (content.join_authorised_via_users_server !== undefined) {
+    if (!isValidUserId(content.join_authorised_via_users_server)) {
+      return {
+        valid: false,
+        error: 'join_authorised_via_users_server must be a valid user ID',
+        errcode: 'M_BAD_JSON',
+      };
+    }
+  }
+
+  // third_party_invite - if present, validate structure
+  // Used for invites via third party identifiers (email, phone)
+  if (content.third_party_invite !== undefined) {
+    const result = validateThirdPartyInvite(content.third_party_invite);
+    if (!result.valid) {
+      return result;
+    }
+  }
+
+  return VALID_RESULT;
+}
+
+/**
+ * Validate third_party_invite structure in m.room.member content
+ * https://spec.matrix.org/v1.12/client-server-api/#mroommember
+ */
+function validateThirdPartyInvite(invite: unknown): ValidationResult {
+  if (typeof invite !== 'object' || invite === null || Array.isArray(invite)) {
+    return {
+      valid: false,
+      error: 'third_party_invite must be an object',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  const inv = invite as Record<string, unknown>;
+
+  // display_name - required string
+  if (typeof inv.display_name !== 'string') {
+    return {
+      valid: false,
+      error: 'third_party_invite must have a "display_name" string',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  // signed - required object
+  if (typeof inv.signed !== 'object' || inv.signed === null || Array.isArray(inv.signed)) {
+    return {
+      valid: false,
+      error: 'third_party_invite must have a "signed" object',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  const signed = inv.signed as Record<string, unknown>;
+
+  // signed.mxid - required valid user ID
+  if (!isValidUserId(signed.mxid)) {
+    return {
+      valid: false,
+      error: 'third_party_invite.signed.mxid must be a valid user ID',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  // signed.token - required string
+  if (typeof signed.token !== 'string' || signed.token.length === 0) {
+    return {
+      valid: false,
+      error: 'third_party_invite.signed.token must be a non-empty string',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  // signed.signatures - required object (server signatures)
+  if (typeof signed.signatures !== 'object' || signed.signatures === null || Array.isArray(signed.signatures)) {
+    return {
+      valid: false,
+      error: 'third_party_invite.signed.signatures must be an object',
+      errcode: 'M_BAD_JSON',
+    };
+  }
+
+  // Validate signatures structure: { "server_name": { "key_id": "signature" } }
+  for (const [serverName, keys] of Object.entries(signed.signatures as Record<string, unknown>)) {
+    if (typeof serverName !== 'string' || serverName.length === 0) {
+      return {
+        valid: false,
+        error: 'third_party_invite signature server name must be a non-empty string',
+        errcode: 'M_BAD_JSON',
+      };
+    }
+    if (typeof keys !== 'object' || keys === null || Array.isArray(keys)) {
+      return {
+        valid: false,
+        error: `third_party_invite signatures for "${serverName}" must be an object`,
+        errcode: 'M_BAD_JSON',
+      };
+    }
+    for (const [keyId, sig] of Object.entries(keys as Record<string, unknown>)) {
+      if (typeof keyId !== 'string' || keyId.length === 0) {
+        return {
+          valid: false,
+          error: 'third_party_invite signature key ID must be a non-empty string',
+          errcode: 'M_BAD_JSON',
+        };
+      }
+      if (typeof sig !== 'string' || sig.length === 0) {
+        return {
+          valid: false,
+          error: `third_party_invite signature for "${keyId}" must be a non-empty string`,
+          errcode: 'M_BAD_JSON',
+        };
+      }
+    }
+  }
+
   return VALID_RESULT;
 }
 

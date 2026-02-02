@@ -1202,6 +1202,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
     reason,
   };
 
+  // Validate membership content
+  const contentValidation = validateEventContent('m.room.member', memberContent);
+  if (!contentValidation.valid) {
+    return c.json(
+      { errcode: contentValidation.errcode || 'M_BAD_JSON', error: contentValidation.error },
+      400
+    );
+  }
+
   const event: PDU = {
     event_id: eventId,
     room_id: roomId,
@@ -1277,6 +1286,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
     membership: 'ban',
     reason,
   };
+
+  // Validate membership content
+  const contentValidation = validateEventContent('m.room.member', memberContent);
+  if (!contentValidation.valid) {
+    return c.json(
+      { errcode: contentValidation.errcode || 'M_BAD_JSON', error: contentValidation.error },
+      400
+    );
+  }
 
   const event: PDU = {
     event_id: eventId,
