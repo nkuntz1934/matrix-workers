@@ -1,5 +1,131 @@
 // Cryptographic utilities for Matrix homeserver
 
+// ============================================================================
+// Base64 Utilities (Matrix uses unpadded Base64)
+// ============================================================================
+
+/**
+ * Convert unpadded Base64 string to Uint8Array
+ */
+export function unpadBase64ToBytes(unpadded: string): Uint8Array {
+  // Add padding if needed
+  const padded = unpadded + '='.repeat((4 - (unpadded.length % 4)) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+}
+
+/**
+ * Convert Uint8Array to unpadded Base64 string
+ */
+export function bytesToUnpadBase64(bytes: Uint8Array): string {
+  const binary = String.fromCharCode(...bytes);
+  return btoa(binary).replace(/=+$/, '');
+}
+
+// ============================================================================
+// Ed25519 Cryptographic Operations
+// ============================================================================
+
+/**
+ * Generate an Ed25519 key pair for signing
+ * Returns keys in formats suitable for Matrix federation:
+ * - publicKey: 32-byte raw key as unpadded Base64
+ * - privateKey: PKCS8-encoded private key as unpadded Base64
+ * - keyId: Matrix key ID format (ed25519:XXXXXXXX)
+ */
+export async function generateEd25519KeyPair(): Promise<{
+  publicKey: string;
+  privateKey: string;
+  keyId: string;
+}> {
+  // Generate Ed25519 key pair using Web Crypto API
+  const keyPair = (await crypto.subtle.generateKey(
+    { name: 'Ed25519' },
+    true, // extractable
+    ['sign', 'verify']
+  )) as CryptoKeyPair;
+
+  // Export public key as raw bytes (32 bytes for Ed25519)
+  const publicKeyRaw = (await crypto.subtle.exportKey('raw', keyPair.publicKey)) as ArrayBuffer;
+  const publicKey = bytesToUnpadBase64(new Uint8Array(publicKeyRaw));
+
+  // Export private key as PKCS8 for storage
+  const privateKeyPkcs8 = (await crypto.subtle.exportKey('pkcs8', keyPair.privateKey)) as ArrayBuffer;
+  const privateKey = bytesToUnpadBase64(new Uint8Array(privateKeyPkcs8));
+
+  // Generate a random key ID (8 hex characters)
+  const keyIdBytes = crypto.getRandomValues(new Uint8Array(4));
+  const keyId = `ed25519:${Array.from(keyIdBytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')}`;
+
+  return { publicKey, privateKey, keyId };
+}
+
+/**
+ * Import an Ed25519 public key from unpadded Base64
+ */
+export async function importEd25519PublicKey(base64Key: string): Promise<CryptoKey> {
+  const keyBytes = unpadBase64ToBytes(base64Key);
+  return crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'Ed25519' },
+    true,
+    ['verify']
+  );
+}
+
+/**
+ * Import an Ed25519 private key from unpadded Base64 (PKCS8 format)
+ */
+export async function importEd25519PrivateKey(base64Key: string): Promise<CryptoKey> {
+  const keyBytes = unpadBase64ToBytes(base64Key);
+  return crypto.subtle.importKey(
+    'pkcs8',
+    keyBytes,
+    { name: 'Ed25519' },
+    true,
+    ['sign']
+  );
+}
+
+/**
+ * Sign data with an Ed25519 private key
+ * @param data - Data to sign
+ * @param privateKey - CryptoKey or unpadded Base64 PKCS8 private key
+ * @returns Signature as unpadded Base64
+ */
+export async function signEd25519(
+  data: Uint8Array,
+  privateKey: CryptoKey | string
+): Promise<string> {
+  const key = typeof privateKey === 'string' ? await importEd25519PrivateKey(privateKey) : privateKey;
+  const signature = await crypto.subtle.sign('Ed25519', key, data);
+  return bytesToUnpadBase64(new Uint8Array(signature));
+}
+
+/**
+ * Verify an Ed25519 signature
+ * @param data - Original data that was signed
+ * @param signature - Signature as unpadded Base64
+ * @param publicKey - CryptoKey or unpadded Base64 public key
+ * @returns true if signature is valid
+ */
+export async function verifyEd25519(
+  data: Uint8Array,
+  signature: string,
+  publicKey: CryptoKey | string
+): Promise<boolean> {
+  const key = typeof publicKey === 'string' ? await importEd25519PublicKey(publicKey) : publicKey;
+  const signatureBytes = unpadBase64ToBytes(signature);
+  return crypto.subtle.verify('Ed25519', key, signatureBytes, data);
+}
+
+// ============================================================================
+// Password Hashing
+// ============================================================================
+
 // Hash a password using PBKDF2 (Web Crypto compatible alternative to Argon2)
 export async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -81,50 +207,92 @@ export async function hashToken(token: string): Promise<string> {
   return sha256(token);
 }
 
-// Generate Ed25519 key pair for signing
+/**
+ * Generate Ed25519 key pair for signing (legacy wrapper)
+ * @deprecated Use generateEd25519KeyPair() directly
+ */
 export async function generateSigningKeyPair(): Promise<{
   publicKey: string;
   privateKey: string;
   keyId: string;
 }> {
-  // Ed25519 is not directly supported in Web Crypto, use a seed-based approach
-  // For production, consider using a library like tweetnacl
-  const seed = crypto.getRandomValues(new Uint8Array(32));
-
-  // Generate a key ID
-  const keyIdBytes = crypto.getRandomValues(new Uint8Array(4));
-  const keyId = `ed25519:${Array.from(keyIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')}`;
-
-  // For now, store the seed as both public and private (placeholder)
-  // In production, use proper Ed25519 implementation
-  const publicKey = btoa(String.fromCharCode(...seed.slice(0, 32)));
-  const privateKey = btoa(String.fromCharCode(...seed));
-
-  return { publicKey, privateKey, keyId };
+  return generateEd25519KeyPair();
 }
 
-// Sign a JSON object (placeholder - needs proper Ed25519)
+/**
+ * Sign a JSON object per Matrix spec
+ * @param obj - Object to sign (signatures and unsigned fields will be removed before signing)
+ * @param serverName - Server name to attribute signature to
+ * @param keyId - Key ID (e.g., "ed25519:abc123")
+ * @param privateKey - Private key as unpadded Base64 (PKCS8 format)
+ * @returns Object with signatures field added
+ */
 export async function signJson(
   obj: Record<string, unknown>,
   serverName: string,
   keyId: string,
-  _privateKey: string
+  privateKey: string
 ): Promise<Record<string, unknown>> {
-  // Canonical JSON representation
-  const canonical = canonicalJson(obj);
-  const hash = await sha256(canonical);
+  // Remove signatures and unsigned before signing (per Matrix spec)
+  const toSign = { ...obj };
+  delete toSign['signatures'];
+  delete toSign['unsigned'];
 
-  // Placeholder signature - in production use Ed25519
-  const signature = hash;
+  // Get canonical JSON representation
+  const canonical = canonicalJson(toSign);
+  const encoder = new TextEncoder();
+  const data = encoder.encode(canonical);
+
+  // Sign with Ed25519
+  const signature = await signEd25519(data, privateKey);
+
+  // Merge with existing signatures if present
+  const existingSignatures = (obj['signatures'] as Record<string, Record<string, string>>) || {};
 
   return {
     ...obj,
     signatures: {
+      ...existingSignatures,
       [serverName]: {
+        ...existingSignatures[serverName],
         [keyId]: signature,
       },
     },
   };
+}
+
+/**
+ * Verify a signature on a JSON object
+ * @param obj - Object with signatures field
+ * @param serverName - Server name that signed
+ * @param keyId - Key ID to verify
+ * @param publicKey - Public key as unpadded Base64
+ * @returns true if signature is valid
+ */
+export async function verifyJsonSignature(
+  obj: Record<string, unknown>,
+  serverName: string,
+  keyId: string,
+  publicKey: string
+): Promise<boolean> {
+  const signatures = obj['signatures'] as Record<string, Record<string, string>> | undefined;
+  if (!signatures || !signatures[serverName] || !signatures[serverName][keyId]) {
+    return false;
+  }
+
+  const signature = signatures[serverName][keyId];
+
+  // Remove signatures and unsigned before verifying (per Matrix spec)
+  const toVerify = { ...obj };
+  delete toVerify['signatures'];
+  delete toVerify['unsigned'];
+
+  // Get canonical JSON representation
+  const canonical = canonicalJson(toVerify);
+  const encoder = new TextEncoder();
+  const data = encoder.encode(canonical);
+
+  return verifyEd25519(data, signature, publicKey);
 }
 
 // Canonical JSON for signing
