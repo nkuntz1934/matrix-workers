@@ -25,6 +25,8 @@ import {
 } from '../services/database';
 import type { JoinResult } from '../workflows';
 import { validateEventContent } from '../services/event-validation';
+import { canSendStateEvent, canModifyPowerLevels } from '../services/power-levels';
+import type { RoomPowerLevelsContent } from '../types/matrix';
 
 const app = new Hono<AppEnv>();
 
@@ -785,6 +787,25 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
       { errcode: contentValidation.errcode || 'M_BAD_JSON', error: contentValidation.error },
       400
     );
+  }
+
+  // Check power level for state events
+  if (eventType === 'm.room.power_levels') {
+    // Special handling for power levels changes
+    const powerCheck = await canModifyPowerLevels(
+      c.env.DB,
+      roomId,
+      userId,
+      content as RoomPowerLevelsContent
+    );
+    if (!powerCheck.allowed) {
+      return Errors.forbidden(powerCheck.reason || 'Insufficient power level').toResponse();
+    }
+  } else {
+    const powerCheck = await canSendStateEvent(c.env.DB, roomId, userId, eventType, stateKey);
+    if (!powerCheck.allowed) {
+      return Errors.forbidden(powerCheck.reason || 'Insufficient power level').toResponse();
+    }
   }
 
   const eventId = await generateEventId(c.env.SERVER_NAME);
