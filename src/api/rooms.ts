@@ -25,6 +25,7 @@ import {
   notifyUsersOfEvent,
 } from '../services/database';
 import { applyRedactionsToEvents } from '../services/redaction';
+import { getVisibilityContext, filterEventsByVisibility } from '../services/history-visibility';
 import type { JoinResult } from '../workflows';
 import { validateEventContent } from '../services/event-validation';
 import { canSendStateEvent, canModifyPowerLevels } from '../services/power-levels';
@@ -923,8 +924,12 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
   }
   const { events, end } = await getRoomEvents(c.env.DB, roomId, fromToken, limit, dir);
 
+  // Filter events by history visibility
+  const visibilityContext = await getVisibilityContext(c.env.DB, roomId, userId);
+  const visibleEvents = filterEventsByVisibility(events, visibilityContext);
+
   // Format events for client
-  const clientEvents = events.map(e => ({
+  const clientEvents = visibleEvents.map(e => ({
     type: e.type,
     state_key: e.state_key,
     content: e.content,
@@ -944,7 +949,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
   };
 
   // Only include 'end' if we have events to paginate from
-  if (events.length > 0) {
+  if (visibleEvents.length > 0) {
     response.end = `s${end}`;
   }
 
@@ -1619,6 +1624,11 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     (id) => getEventRaw(c.env.DB, id)
   );
 
+  // Filter by history visibility
+  const visibilityContext = await getVisibilityContext(c.env.DB, roomId, userId);
+  const visibleEventsBefore = filterEventsByVisibility(processedEventsBefore, visibilityContext);
+  const visibleEventsAfter = filterEventsByVisibility(processedEventsAfter, visibilityContext);
+
   // Format events for client response
   const formatEvent = (e: PDU) => ({
     type: e.type,
@@ -1646,8 +1656,8 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
 
   return c.json({
     event: formatEvent(targetEvent),
-    events_before: processedEventsBefore.reverse().map(formatEvent),
-    events_after: processedEventsAfter.map(formatEvent),
+    events_before: visibleEventsBefore.reverse().map(formatEvent),
+    events_after: visibleEventsAfter.map(formatEvent),
     state: stateEvents,
     start: eventsBefore.results.length > 0 ? String(eventsBefore.results[0].origin_server_ts) : undefined,
     end: eventsAfter.results.length > 0 ? String(eventsAfter.results[eventsAfter.results.length - 1].origin_server_ts) : undefined,

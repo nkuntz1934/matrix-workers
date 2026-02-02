@@ -9,6 +9,7 @@ import {
   getEventsSince,
   getLatestStreamPosition,
 } from '../services/database';
+import { getVisibilityContext, filterEventsByVisibility } from '../services/history-visibility';
 import { getToDeviceMessages } from './to-device';
 import {
   getGlobalAccountData,
@@ -382,11 +383,15 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // Get events since last sync
     const events = await getEventsSince(c.env.DB, roomId, sincePosition);
 
+    // Filter events by history visibility
+    const visibilityContext = await getVisibilityContext(c.env.DB, roomId, userId);
+    const visibleEvents = filterEventsByVisibility(events, visibilityContext);
+
     // Separate state and timeline events
     let stateEvents: any[] = [];
     let timelineEvents: any[] = [];
 
-    for (const event of events) {
+    for (const event of visibleEvents) {
       const clientEvent = {
         type: event.type,
         state_key: event.state_key,
