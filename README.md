@@ -12,16 +12,34 @@ A live instance is running at `m.easydemo.org`. You can verify federation compat
 
 ## Spec Compliance
 
-**Matrix Specification v1.17 Compliance: ~100%**
+**[Matrix Specification v1.17](https://spec.matrix.org/v1.17/) Compliance**
 
-| Spec Section | Coverage |
-|--------------|----------|
-| Client-Server API | ~100% |
-| Server-Server (Federation) API | ~100% |
-| Room Versions | v1-v12 (100%) |
-| E2EE (Keys) | ~100% |
-| Discovery | 100% |
-| 3PID (Identity) | ~100% |
+| Spec Section | Implementation | Spec Reference |
+|--------------|----------------|----------------|
+| [Client-Server API](https://spec.matrix.org/v1.17/client-server-api/) | [`src/api/`](src/api/) | Auth, sync, rooms, messaging, profiles |
+| [Server-Server API](https://spec.matrix.org/v1.17/server-server-api/) | [`src/api/federation.ts`](src/api/federation.ts) | Federation, PDUs, EDUs, key exchange |
+| [Room Versions](https://spec.matrix.org/v1.17/rooms/) | [`src/services/events.ts`](src/services/events.ts) | v1-v12, event auth, state resolution |
+| [End-to-End Encryption](https://spec.matrix.org/v1.17/client-server-api/#end-to-end-encryption) | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/key-backups.ts`](src/api/key-backups.ts) | Device keys, OTKs, cross-signing, key backup |
+| [OAuth 2.0 API](https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api) | [`src/api/oauth.ts`](src/api/oauth.ts), [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | MSC3861, MSC2965, MSC2967, MSC4191 |
+| [Discovery](https://spec.matrix.org/v1.17/client-server-api/#server-discovery) | [`src/index.ts`](src/index.ts) | `.well-known/matrix/client`, `/versions` |
+| [Content Repository](https://spec.matrix.org/v1.17/client-server-api/#content-repository) | [`src/api/media.ts`](src/api/media.ts) | Upload, download, thumbnails, MSC3916 |
+| [Push Notifications](https://spec.matrix.org/v1.17/client-server-api/#push-notifications) | [`src/api/push.ts`](src/api/push.ts), [`src/workflows/`](src/workflows/) | Push rules, pushers |
+| [Presence](https://spec.matrix.org/v1.17/client-server-api/#presence) | [`src/api/presence.ts`](src/api/presence.ts) | Online/offline status |
+| [Typing Notifications](https://spec.matrix.org/v1.17/client-server-api/#typing-notifications) | [`src/api/typing.ts`](src/api/typing.ts) | Typing indicators |
+| [Receipts](https://spec.matrix.org/v1.17/client-server-api/#receipts) | [`src/api/receipts.ts`](src/api/receipts.ts) | Read receipts |
+| [Spaces](https://spec.matrix.org/v1.17/client-server-api/#spaces) | [`src/api/spaces.ts`](src/api/spaces.ts) | Space hierarchy |
+| [VoIP](https://spec.matrix.org/v1.17/client-server-api/#voice-over-ip) | [`src/api/voip.ts`](src/api/voip.ts), [`src/api/calls.ts`](src/api/calls.ts) | TURN servers, MatrixRTC |
+| [Account Data](https://spec.matrix.org/v1.17/client-server-api/#client-config) | [`src/api/account-data.ts`](src/api/account-data.ts) | User/room account data |
+| [3PID Management](https://spec.matrix.org/v1.17/client-server-api/#adding-account-administrative-contact-information) | [`src/api/account.ts`](src/api/account.ts) | Email verification, 3PID binding |
+
+**Unstable Features (MSCs)**
+
+| Feature | Implementation | MSC |
+|---------|----------------|-----|
+| Sliding Sync | [`src/api/sliding-sync.ts`](src/api/sliding-sync.ts) | [MSC3575](https://github.com/matrix-org/matrix-spec-proposals/pull/3575), [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) |
+| Authenticated Media | [`src/api/media.ts`](src/api/media.ts) | [MSC3916](https://github.com/matrix-org/matrix-spec-proposals/pull/3916) |
+| Cross-signing Reset | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/oauth.ts`](src/api/oauth.ts) | [MSC4312](https://github.com/matrix-org/matrix-spec-proposals/pull/4312) |
+| Account Management | [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | [MSC4191](https://github.com/matrix-org/matrix-spec-proposals/pull/4191) |
 
 ## Features
 
