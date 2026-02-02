@@ -58,6 +58,9 @@ export interface Env {
   // Cloudflare Workflows for durable multi-step operations
   ROOM_JOIN_WORKFLOW: Workflow;
   PUSH_NOTIFICATION_WORKFLOW: Workflow;
+
+  // Federation signature enforcement: 'log' (warn only) or 'enforce' (reject invalid)
+  SIGNATURE_ENFORCEMENT?: string;
 }
 
 // Variables set by middleware and available via c.get()

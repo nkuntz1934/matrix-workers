@@ -4,8 +4,18 @@ import { Hono } from 'hono';
 import type { AppEnv, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson } from '../utils/crypto';
+import { verifyPduSignature } from '../services/federation-keys';
 
 const app = new Hono<AppEnv>();
+
+// Signature enforcement mode: 'log' (warn only) or 'enforce' (reject invalid)
+type SignatureEnforcement = 'log' | 'enforce';
+
+function getSignatureEnforcement(env: { SIGNATURE_ENFORCEMENT?: string }): SignatureEnforcement {
+  const mode = env.SIGNATURE_ENFORCEMENT;
+  if (mode === 'enforce') return 'enforce';
+  return 'log'; // Default to log-only mode for gradual rollout
+}
 
 // GET /_matrix/key/v2/server - Get server signing keys
 app.get('/_matrix/key/v2/server', async (c) => {
@@ -110,10 +120,36 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
   const { pdus, edus: _edus } = body;
   const pduResults: Record<string, any> = {};
+  const enforcement = getSignatureEnforcement(c.env);
 
   // Process incoming PDUs
   for (const pdu of pdus || []) {
     try {
+      // Determine origin server for this PDU
+      // Use the 'origin' field if present, otherwise extract from sender
+      const pduOrigin = pdu.origin || extractServerName(pdu.sender);
+
+      if (!pduOrigin) {
+        pduResults[pdu.event_id] = { error: 'Cannot determine origin server' };
+        continue;
+      }
+
+      // Verify PDU signature
+      const sigResult = await verifyPduSignature(c.env, pdu, pduOrigin);
+
+      if (!sigResult.valid) {
+        if (enforcement === 'enforce') {
+          pduResults[pdu.event_id] = { error: sigResult.error || 'Invalid signature' };
+          continue;
+        } else {
+          // Log-only mode: warn but continue processing
+          console.warn(
+            `[SIGNATURE] Invalid signature on PDU ${pdu.event_id} from ${pduOrigin}: ${sigResult.error}`
+          );
+        }
+      }
+
+      // TODO: Additional validation (auth rules, state resolution) will be added in later phases
       pduResults[pdu.event_id] = {};
     } catch (e: any) {
       pduResults[pdu.event_id] = {
@@ -127,6 +163,20 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
   return c.json({ pdus: pduResults });
 });
+
+/**
+ * Extract server name from a Matrix user ID (@user:server.name)
+ */
+function extractServerName(userId: string): string | null {
+  if (!userId || !userId.startsWith('@')) {
+    return null;
+  }
+  const colonIndex = userId.indexOf(':');
+  if (colonIndex === -1) {
+    return null;
+  }
+  return userId.slice(colonIndex + 1);
+}
 
 // GET /_matrix/federation/v1/event/:eventId - Get a single event
 app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
