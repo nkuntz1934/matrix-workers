@@ -8,6 +8,15 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
+import {
+  createUiaSession,
+  getUiaSession,
+  deleteUiaSession,
+  completeUiaStage,
+  isUiaComplete,
+  buildUiaResponse,
+  StandardFlows,
+} from '../services/uia';
 
 const app = new Hono<AppEnv>();
 
@@ -128,31 +137,104 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     // No auth provided
   }
 
-  // If no auth provided, return UIA response
+  // No auth provided - create UIA session
   if (!auth) {
-    const sessionId = crypto.randomUUID();
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { device_id: deviceId }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get or validate session
+  const sessionId = auth.session;
+  if (!sessionId) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { device_id: deviceId }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get the session
+  const session = await getUiaSession(c.env.CACHE, sessionId);
+  if (!session) {
+    const newSession = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { device_id: deviceId }
+    );
     return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
+      ...buildUiaResponse(newSession),
+      error: 'Session expired, please retry',
+      errcode: 'M_UNKNOWN',
     }, 401);
   }
 
-  // Verify password if auth provided
+  // Validate session belongs to this user
+  if (session.user_id && session.user_id !== userId) {
+    return Errors.forbidden('Session user mismatch').toResponse();
+  }
+
+  // Validate session type
+  if (session.type !== 'device_deletion') {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Invalid session type for device deletion',
+    }, 403);
+  }
+
+  // Process auth stage
   if (auth.type === 'm.login.password') {
     const user = await db.prepare(`
       SELECT password_hash FROM users WHERE user_id = ?
     `).bind(userId).first<{ password_hash: string }>();
 
-    if (!user || !auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
+    if (!user) {
+      return Errors.forbidden('User not found').toResponse();
+    }
+
+    if (!auth.password) {
+      return Errors.missingParam('auth.password').toResponse();
     }
 
     const valid = await verifyPassword(auth.password, user.password_hash);
     if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
+      return c.json({
+        ...buildUiaResponse(session),
+        error: 'Invalid password',
+        errcode: 'M_FORBIDDEN',
+      }, 401);
     }
+
+    // Password verified - mark stage complete
+    await completeUiaStage(c.env.CACHE, sessionId, 'm.login.password');
+  } else if (auth.type) {
+    return c.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unknown auth type: ${auth.type}`,
+    }, 400);
   }
+
+  // Check if UIA is complete
+  const updatedSession = await getUiaSession(c.env.CACHE, sessionId);
+  if (!updatedSession || !isUiaComplete(updatedSession)) {
+    return c.json(buildUiaResponse(updatedSession || session), 401);
+  }
+
+  // UIA complete - clean up session
+  await deleteUiaSession(c.env.CACHE, sessionId);
 
   // Delete the device and its access tokens
   await db.prepare(`
@@ -186,31 +268,106 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
     return Errors.missingParam('devices').toResponse();
   }
 
-  // If no auth provided, return UIA response
-  if (!body.auth) {
-    const sessionId = crypto.randomUUID();
+  const auth = body.auth;
+
+  // No auth provided - create UIA session
+  if (!auth) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { devices: body.devices }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get or validate session
+  const sessionId = auth.session;
+  if (!sessionId) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { devices: body.devices }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get the session
+  const session = await getUiaSession(c.env.CACHE, sessionId);
+  if (!session) {
+    const newSession = await createUiaSession(
+      c.env.CACHE,
+      'device_deletion',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { devices: body.devices }
+    );
     return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
+      ...buildUiaResponse(newSession),
+      error: 'Session expired, please retry',
+      errcode: 'M_UNKNOWN',
     }, 401);
   }
 
-  // Verify password if auth provided
-  if (body.auth.type === 'm.login.password') {
+  // Validate session belongs to this user
+  if (session.user_id && session.user_id !== userId) {
+    return Errors.forbidden('Session user mismatch').toResponse();
+  }
+
+  // Validate session type
+  if (session.type !== 'device_deletion') {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Invalid session type for device deletion',
+    }, 403);
+  }
+
+  // Process auth stage
+  if (auth.type === 'm.login.password') {
     const user = await db.prepare(`
       SELECT password_hash FROM users WHERE user_id = ?
     `).bind(userId).first<{ password_hash: string }>();
 
-    if (!user || !body.auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
+    if (!user) {
+      return Errors.forbidden('User not found').toResponse();
     }
 
-    const valid = await verifyPassword(body.auth.password, user.password_hash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
+    if (!auth.password) {
+      return Errors.missingParam('auth.password').toResponse();
     }
+
+    const valid = await verifyPassword(auth.password, user.password_hash);
+    if (!valid) {
+      return c.json({
+        ...buildUiaResponse(session),
+        error: 'Invalid password',
+        errcode: 'M_FORBIDDEN',
+      }, 401);
+    }
+
+    // Password verified - mark stage complete
+    await completeUiaStage(c.env.CACHE, sessionId, 'm.login.password');
+  } else if (auth.type) {
+    return c.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unknown auth type: ${auth.type}`,
+    }, 400);
   }
+
+  // Check if UIA is complete
+  const updatedSession = await getUiaSession(c.env.CACHE, sessionId);
+  if (!updatedSession || !isUiaComplete(updatedSession)) {
+    return c.json(buildUiaResponse(updatedSession || session), 401);
+  }
+
+  // UIA complete - clean up session
+  await deleteUiaSession(c.env.CACHE, sessionId);
 
   // Delete each device
   for (const deviceId of body.devices) {

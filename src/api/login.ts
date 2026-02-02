@@ -13,6 +13,15 @@ import {
   isValidLocalpart,
 } from '../utils/ids';
 import {
+  createUiaSession,
+  getUiaSession,
+  deleteUiaSession,
+  completeUiaStage,
+  isUiaComplete,
+  buildUiaResponse,
+  StandardFlows,
+} from '../services/uia';
+import {
   createUser,
   getUserByLocalpart,
   getUserById,
@@ -324,19 +333,86 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   const isGuest = kind === 'guest';
 
-  // For non-guests, require username and password
+  // For non-guests, require UIA
   if (!isGuest) {
-    // Simple auth - in production, implement UIA (User-Interactive Authentication)
-    if (!auth || auth.type !== 'm.login.dummy') {
-      // Return UIA requirements
-      const sessionId = await generateOpaqueId(16);
+    // No auth provided - create new UIA session
+    if (!auth) {
+      const session = await createUiaSession(
+        c.env.CACHE,
+        'registration',
+        StandardFlows.registration,
+        {},
+        undefined,
+        { username } // Store username in context for validation
+      );
+      return c.json(buildUiaResponse(session), 401);
+    }
+
+    // Auth provided - validate the session
+    const sessionId = auth.session;
+    if (!sessionId) {
+      // No session but auth provided - create session and return challenge
+      const session = await createUiaSession(
+        c.env.CACHE,
+        'registration',
+        StandardFlows.registration,
+        {},
+        undefined,
+        { username }
+      );
+      return c.json(buildUiaResponse(session), 401);
+    }
+
+    // Get the session
+    const session = await getUiaSession(c.env.CACHE, sessionId);
+    if (!session) {
+      // Session expired or invalid - create new one
+      const newSession = await createUiaSession(
+        c.env.CACHE,
+        'registration',
+        StandardFlows.registration,
+        {},
+        undefined,
+        { username }
+      );
       return c.json({
-        flows: [{ stages: ['m.login.dummy'] }],
-        params: {},
-        session: sessionId,
+        ...buildUiaResponse(newSession),
+        error: 'Session expired, please retry',
+        errcode: 'M_UNKNOWN',
       }, 401);
     }
 
+    // Validate session type
+    if (session.type !== 'registration') {
+      return c.json({
+        errcode: 'M_FORBIDDEN',
+        error: 'Invalid session type for registration',
+      }, 403);
+    }
+
+    // Process the auth stage
+    if (auth.type === 'm.login.dummy') {
+      // m.login.dummy always succeeds
+      await completeUiaStage(c.env.CACHE, sessionId, 'm.login.dummy');
+    } else if (auth.type) {
+      // Unknown auth type
+      return c.json({
+        errcode: 'M_UNRECOGNIZED',
+        error: `Unknown auth type: ${auth.type}`,
+      }, 400);
+    }
+
+    // Refresh session and check if complete
+    const updatedSession = await getUiaSession(c.env.CACHE, sessionId);
+    if (!updatedSession || !isUiaComplete(updatedSession)) {
+      // Not all stages completed - return current state
+      return c.json(buildUiaResponse(updatedSession || session), 401);
+    }
+
+    // UIA complete - clean up session before proceeding
+    await deleteUiaSession(c.env.CACHE, sessionId);
+
+    // Validate username and password
     if (!username) {
       return Errors.missingParam('username').toResponse();
     }

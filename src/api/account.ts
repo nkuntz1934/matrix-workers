@@ -8,7 +8,6 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { hashPassword, verifyPassword } from '../utils/crypto';
-import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, deleteAllUserTokens } from '../services/database';
 import {
   sendVerificationEmail,
@@ -16,6 +15,15 @@ import {
   validateEmailToken,
   getValidatedSession,
 } from '../services/email';
+import {
+  createUiaSession,
+  getUiaSession,
+  deleteUiaSession,
+  completeUiaStage,
+  isUiaComplete,
+  buildUiaResponse,
+  StandardFlows,
+} from '../services/uia';
 
 const app = new Hono<AppEnv>();
 
@@ -46,31 +54,102 @@ app.post('/_matrix/client/v3/account/password', requireAuth(), async (c) => {
     return Errors.missingParam('new_password').toResponse();
   }
 
-  // Require UIA for password change
-  if (!auth || auth.type !== 'm.login.password') {
-    const sessionId = await generateOpaqueId(16);
+  // No auth provided - create UIA session
+  if (!auth) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'password_change',
+      StandardFlows.passwordRequired,
+      {},
+      userId
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get or validate session
+  const sessionId = auth.session;
+  if (!sessionId) {
+    // No session - create one
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'password_change',
+      StandardFlows.passwordRequired,
+      {},
+      userId
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get the session
+  const session = await getUiaSession(c.env.CACHE, sessionId);
+  if (!session) {
+    // Session expired - create new one
+    const newSession = await createUiaSession(
+      c.env.CACHE,
+      'password_change',
+      StandardFlows.passwordRequired,
+      {},
+      userId
+    );
     return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
+      ...buildUiaResponse(newSession),
+      error: 'Session expired, please retry',
+      errcode: 'M_UNKNOWN',
     }, 401);
   }
 
-  // Verify current password
-  const storedHash = await getPasswordHash(db, userId);
-  if (!storedHash) {
-    return Errors.forbidden('No password set for user').toResponse();
+  // Validate session belongs to this user
+  if (session.user_id && session.user_id !== userId) {
+    return Errors.forbidden('Session user mismatch').toResponse();
   }
 
-  // The auth.password should contain current password
-  if (!auth.password) {
-    return Errors.missingParam('auth.password').toResponse();
+  // Validate session type
+  if (session.type !== 'password_change') {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Invalid session type for password change',
+    }, 403);
   }
 
-  const valid = await verifyPassword(auth.password, storedHash);
-  if (!valid) {
-    return Errors.forbidden('Invalid password').toResponse();
+  // Process auth stage
+  if (auth.type === 'm.login.password') {
+    // Verify current password
+    const storedHash = await getPasswordHash(db, userId);
+    if (!storedHash) {
+      return Errors.forbidden('No password set for user').toResponse();
+    }
+
+    if (!auth.password) {
+      return Errors.missingParam('auth.password').toResponse();
+    }
+
+    const valid = await verifyPassword(auth.password, storedHash);
+    if (!valid) {
+      // Return UIA response with error
+      return c.json({
+        ...buildUiaResponse(session),
+        error: 'Invalid password',
+        errcode: 'M_FORBIDDEN',
+      }, 401);
+    }
+
+    // Password verified - mark stage complete
+    await completeUiaStage(c.env.CACHE, sessionId, 'm.login.password');
+  } else if (auth.type) {
+    return c.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unknown auth type: ${auth.type}`,
+    }, 400);
   }
+
+  // Check if UIA is complete
+  const updatedSession = await getUiaSession(c.env.CACHE, sessionId);
+  if (!updatedSession || !isUiaComplete(updatedSession)) {
+    return c.json(buildUiaResponse(updatedSession || session), 401);
+  }
+
+  // UIA complete - clean up session
+  await deleteUiaSession(c.env.CACHE, sessionId);
 
   // Hash new password
   const newHash = await hashPassword(new_password);
@@ -129,24 +208,99 @@ app.post('/_matrix/client/v3/account/deactivate', requireAuth(), async (c) => {
 
   const { erase = false, auth } = body;
 
-  // Require UIA for account deactivation
-  if (!auth || auth.type !== 'm.login.password') {
-    const sessionId = await generateOpaqueId(16);
+  // No auth provided - create UIA session
+  if (!auth) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'account_deactivation',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { erase }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get or validate session
+  const sessionId = auth.session;
+  if (!sessionId) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'account_deactivation',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { erase }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get the session
+  const session = await getUiaSession(c.env.CACHE, sessionId);
+  if (!session) {
+    const newSession = await createUiaSession(
+      c.env.CACHE,
+      'account_deactivation',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { erase }
+    );
     return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
+      ...buildUiaResponse(newSession),
+      error: 'Session expired, please retry',
+      errcode: 'M_UNKNOWN',
     }, 401);
   }
 
-  // Verify password
-  const storedHash = await getPasswordHash(db, userId);
-  if (storedHash && auth.password) {
-    const valid = await verifyPassword(auth.password, storedHash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
+  // Validate session belongs to this user
+  if (session.user_id && session.user_id !== userId) {
+    return Errors.forbidden('Session user mismatch').toResponse();
   }
+
+  // Validate session type
+  if (session.type !== 'account_deactivation') {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Invalid session type for account deactivation',
+    }, 403);
+  }
+
+  // Process auth stage
+  if (auth.type === 'm.login.password') {
+    const storedHash = await getPasswordHash(db, userId);
+    if (storedHash) {
+      if (!auth.password) {
+        return Errors.missingParam('auth.password').toResponse();
+      }
+
+      const valid = await verifyPassword(auth.password, storedHash);
+      if (!valid) {
+        return c.json({
+          ...buildUiaResponse(session),
+          error: 'Invalid password',
+          errcode: 'M_FORBIDDEN',
+        }, 401);
+      }
+    }
+
+    // Password verified (or no password set) - mark stage complete
+    await completeUiaStage(c.env.CACHE, sessionId, 'm.login.password');
+  } else if (auth.type) {
+    return c.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unknown auth type: ${auth.type}`,
+    }, 400);
+  }
+
+  // Check if UIA is complete
+  const updatedSession = await getUiaSession(c.env.CACHE, sessionId);
+  if (!updatedSession || !isUiaComplete(updatedSession)) {
+    return c.json(buildUiaResponse(updatedSession || session), 401);
+  }
+
+  // UIA complete - clean up session
+  await deleteUiaSession(c.env.CACHE, sessionId);
 
   // Mark user as deactivated
   await db.prepare(`
@@ -219,7 +373,7 @@ app.post('/_matrix/client/v3/account/3pid/add', requireAuth(), async (c) => {
   let body: {
     client_secret: string;
     sid: string;
-    auth?: { type: string; session?: string };
+    auth?: { type: string; session?: string; password?: string };
   };
 
   try {
@@ -234,17 +388,101 @@ app.post('/_matrix/client/v3/account/3pid/add', requireAuth(), async (c) => {
     return Errors.missingParam('client_secret and sid are required').toResponse();
   }
 
-  // Require UIA for adding 3PID
-  if (!auth || auth.type !== 'm.login.password') {
-    const sessionId = await generateOpaqueId(16);
+  // No auth provided - create UIA session
+  if (!auth) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'threepid_add',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { client_secret, sid }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get or validate session
+  const uiaSessionId = auth.session;
+  if (!uiaSessionId) {
+    const session = await createUiaSession(
+      c.env.CACHE,
+      'threepid_add',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { client_secret, sid }
+    );
+    return c.json(buildUiaResponse(session), 401);
+  }
+
+  // Get the UIA session
+  const uiaSession = await getUiaSession(c.env.CACHE, uiaSessionId);
+  if (!uiaSession) {
+    const newSession = await createUiaSession(
+      c.env.CACHE,
+      'threepid_add',
+      StandardFlows.passwordRequired,
+      {},
+      userId,
+      { client_secret, sid }
+    );
     return c.json({
-      flows: [{ stages: ['m.login.password'] }],
-      params: {},
-      session: sessionId,
+      ...buildUiaResponse(newSession),
+      error: 'Session expired, please retry',
+      errcode: 'M_UNKNOWN',
     }, 401);
   }
 
-  // Verify the session is validated
+  // Validate session belongs to this user
+  if (uiaSession.user_id && uiaSession.user_id !== userId) {
+    return Errors.forbidden('Session user mismatch').toResponse();
+  }
+
+  // Validate session type
+  if (uiaSession.type !== 'threepid_add') {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: 'Invalid session type for adding 3PID',
+    }, 403);
+  }
+
+  // Process auth stage
+  if (auth.type === 'm.login.password') {
+    const storedHash = await getPasswordHash(db, userId);
+    if (storedHash) {
+      if (!auth.password) {
+        return Errors.missingParam('auth.password').toResponse();
+      }
+
+      const valid = await verifyPassword(auth.password, storedHash);
+      if (!valid) {
+        return c.json({
+          ...buildUiaResponse(uiaSession),
+          error: 'Invalid password',
+          errcode: 'M_FORBIDDEN',
+        }, 401);
+      }
+    }
+
+    // Password verified - mark stage complete
+    await completeUiaStage(c.env.CACHE, uiaSessionId, 'm.login.password');
+  } else if (auth.type) {
+    return c.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unknown auth type: ${auth.type}`,
+    }, 400);
+  }
+
+  // Check if UIA is complete
+  const updatedSession = await getUiaSession(c.env.CACHE, uiaSessionId);
+  if (!updatedSession || !isUiaComplete(updatedSession)) {
+    return c.json(buildUiaResponse(updatedSession || uiaSession), 401);
+  }
+
+  // UIA complete - clean up session
+  await deleteUiaSession(c.env.CACHE, uiaSessionId);
+
+  // Verify the email verification session is validated
   const validatedSession = await getValidatedSession(db, sid, client_secret);
   if (!validatedSession) {
     return c.json({
