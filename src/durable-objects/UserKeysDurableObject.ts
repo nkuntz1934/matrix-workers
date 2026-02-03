@@ -82,8 +82,9 @@ export class UserKeysDurableObject extends DurableObject<Env> {
 
       return new Response('Not found', { status: 404 });
     } catch (error) {
+      // Log error internally but don't expose stack traces to clients
       console.error('[UserKeysDO] Error:', error);
-      return new Response(JSON.stringify({ error: String(error) }), {
+      return new Response(JSON.stringify({ error: 'Internal server error' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
       });

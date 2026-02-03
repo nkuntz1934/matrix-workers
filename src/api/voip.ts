@@ -24,7 +24,8 @@ app.get('/_matrix/client/v3/voip/turnServer', requireAuth(), async (c) => {
     // Get credentials with 1 hour TTL (good balance of security and usability)
     // Pass userId for per-user rate limiting
     const creds = await getMatrixTurnCredentials(c.env, 3600, userId);
-    console.log('TURN credentials response:', JSON.stringify(creds));
+    // Don't log credentials - they are sensitive
+    console.log('[voip] TURN credentials generated successfully');
     return c.json(creds);
   } catch (error) {
     if (error instanceof TurnError) {

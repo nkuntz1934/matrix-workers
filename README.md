@@ -1,6 +1,7 @@
 # Matrix Homeserver on Cloudflare Workers
 
 [![Security](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml)
+
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
 
 This is a proof of concept Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. This was built to prove E2EE utilizing Matrix protocols over Element X on the Cloudflare Workers Platform. It is meant to serve as an example prototype and not endorsed as ready for production at this point.

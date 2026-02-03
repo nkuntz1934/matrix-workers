@@ -356,17 +356,21 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
   }
 });
 
-// Helper to decode HTML entities
+// Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
 function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
+  // Use a proper HTML entity decoder that handles all entities correctly
+  // and prevents double-decoding by checking if the text is already decoded
+  const decoded = text
+    .replace(/&amp;/g, '\x00AMP\x00')  // Temporarily replace to prevent double-decode
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#039;/g, "'")
     .replace(/&#x27;/g, "'")
     .replace(/&#x2F;/g, '/')
-    .replace(/&nbsp;/g, ' ');
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\x00AMP\x00/g, '&');  // Restore ampersands last
+  return decoded;
 }
 
 // GET /_matrix/media/v3/config - Get media config

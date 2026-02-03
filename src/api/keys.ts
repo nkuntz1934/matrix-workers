@@ -586,7 +586,8 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
   // Check user's authentication capabilities
   const userIsOIDC = await isOIDCUser(db, userId);
   const userHasPassword = await hasPassword(db, userId);
-  console.log('[keys] User is OIDC:', userIsOIDC, 'Has password:', userHasPassword);
+  // Log auth method type without exposing sensitive details
+  console.log('[keys] User auth method: OIDC=' + (userIsOIDC ? 'yes' : 'no') + ', password=' + (userHasPassword ? 'yes' : 'no'));
 
   // MSC3967: Do not require UIA when first uploading cross-signing keys
   // Per Matrix spec v1.11+, if user has NO existing cross-signing keys, skip UIA for first-time setup

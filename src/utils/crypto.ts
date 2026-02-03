@@ -307,6 +307,20 @@ export async function verifyContentHash(
 // Generate a random string for CSRF tokens, etc.
 export function generateRandomString(length: number = 32): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
-  return Array.from(bytes).map(b => chars[b % chars.length]).join('');
+  const charsLen = chars.length; // 62 characters
+  // Use rejection sampling to avoid modulo bias
+  // 256 % 62 = 8, so we reject values >= 248 to ensure uniform distribution
+  const maxValid = 256 - (256 % charsLen); // 248
+  const result: string[] = [];
+  
+  while (result.length < length) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length - result.length));
+    for (const b of bytes) {
+      if (b < maxValid && result.length < length) {
+        result.push(chars[b % charsLen]);
+      }
+    }
+  }
+  
+  return result.join('');
 }
