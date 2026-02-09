@@ -11,6 +11,9 @@ import {
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
+import { checkEventAuth } from '../services/event-auth';
+import { getRoomState } from '../services/database';
+import { resolveState } from '../services/state-resolution';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
@@ -578,8 +581,26 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
       // Check if the room exists locally
       const room = await c.env.DB.prepare(
-        `SELECT room_id FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string }>();
+        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+      ).bind(roomId).first<{ room_id: string; room_version: string }>();
+
+      // Run event authorization check if we have room state
+      if (room) {
+        try {
+          const roomState = await getRoomState(c.env.DB, roomId);
+          const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
+          if (!authResult.allowed) {
+            pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
+            await c.env.DB.prepare(
+              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+               VALUES (?, ?, ?, ?, 0, ?)`
+            ).bind(eventId, pduOrigin, roomId, Date.now(), authResult.error || 'Auth failed').run();
+            continue;
+          }
+        } catch (authErr) {
+          console.warn(`[federation] Auth check failed for ${eventId}, accepting anyway:`, authErr);
+        }
+      }
 
       // Accept the PDU
       pduResults[eventId] = {};
@@ -612,12 +633,49 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             pdu.signatures ? JSON.stringify(pdu.signatures) : null
           ).run();
 
-          // Update room state if this is a state event
+          // Update room state
           if (pdu.state_key !== undefined) {
-            await c.env.DB.prepare(
-              `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-               VALUES (?, ?, ?, ?)`
-            ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
+            // If the PDU has multiple prev_events, we may need state resolution
+            const prevEvents = pdu.prev_events || [];
+            if (prevEvents.length > 1 && room) {
+              try {
+                // Fetch current room state and resolve with new event
+                const currentState = await getRoomState(c.env.DB, roomId);
+                const newEvent: PDU = {
+                  event_id: eventId,
+                  room_id: roomId,
+                  sender: pdu.sender,
+                  type: pdu.type,
+                  state_key: pdu.state_key,
+                  content: pdu.content,
+                  origin_server_ts: pdu.origin_server_ts,
+                  depth: pdu.depth || 0,
+                  auth_events: pdu.auth_events || [],
+                  prev_events: prevEvents,
+                };
+                const resolved = resolveState(room.room_version, [currentState, [newEvent]]);
+                // Apply resolved state
+                for (const stateEvent of resolved) {
+                  if (stateEvent.state_key !== undefined) {
+                    await c.env.DB.prepare(
+                      `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+                       VALUES (?, ?, ?, ?)`
+                    ).bind(roomId, stateEvent.type, stateEvent.state_key, stateEvent.event_id).run();
+                  }
+                }
+              } catch (resolveErr) {
+                console.warn(`[federation] State resolution failed for ${eventId}, falling back:`, resolveErr);
+                await c.env.DB.prepare(
+                  `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+                   VALUES (?, ?, ?, ?)`
+                ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
+              }
+            } else {
+              await c.env.DB.prepare(
+                `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+                 VALUES (?, ?, ?, ?)`
+              ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
+            }
           }
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);

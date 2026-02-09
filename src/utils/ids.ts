@@ -1,6 +1,7 @@
 // Matrix ID generation utilities
 
 import type { UserId, RoomId, EventId, RoomAlias, DeviceId } from '../types';
+import { getRoomVersion, type EventIdFormat } from '../services/room-versions';
 
 // Generate a random opaque ID using Web Crypto API
 export async function generateOpaqueId(length: number = 18): Promise<string> {
@@ -48,16 +49,30 @@ export function parseRoomId(roomId: RoomId): { opaque: string; serverName: strin
   return { opaque: match[1], serverName: match[2] };
 }
 
-// Generate an event ID (room version 4+ format)
-export async function generateEventId(_serverName: string): Promise<EventId> {
+// Generate an event ID appropriate for the given room version
+export async function generateEventId(serverName: string, roomVersion?: string): Promise<EventId> {
+  const format = getEventIdFormat(roomVersion);
+  if (format === 'v1') {
+    // Room versions 1-2: $opaque:domain
+    const opaque = await generateOpaqueId(18);
+    return `$${opaque}:${serverName}`;
+  }
+  // Room versions 3+: $base64url (no domain)
   const opaque = await generateOpaqueId(32);
   return `$${opaque}`;
 }
 
-// Generate a legacy event ID (room version 1-3)
+// Generate a legacy event ID (room version 1-2)
 export async function generateLegacyEventId(serverName: string): Promise<EventId> {
   const opaque = await generateOpaqueId(18);
   return `$${opaque}:${serverName}`;
+}
+
+// Get the event ID format for a room version
+function getEventIdFormat(roomVersion?: string): EventIdFormat {
+  if (!roomVersion) return 'v4';
+  const version = getRoomVersion(roomVersion);
+  return version?.eventIdFormat ?? 'v4';
 }
 
 // Format a room alias

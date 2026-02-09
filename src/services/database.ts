@@ -634,6 +634,115 @@ export async function getEventsSince(
   }));
 }
 
+// Batch retrieve events by IDs
+export async function getEventsByIds(db: D1Database, eventIds: string[]): Promise<PDU[]> {
+  if (eventIds.length === 0) return [];
+
+  // D1 doesn't support array binding, so we batch with placeholders
+  const placeholders = eventIds.map(() => '?').join(', ');
+  const result = await db.prepare(
+    `SELECT event_id, room_id, sender, event_type, state_key, content,
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+     FROM events WHERE event_id IN (${placeholders})`
+  ).bind(...eventIds).all<{
+    event_id: string;
+    room_id: string;
+    sender: string;
+    event_type: string;
+    state_key: string | null;
+    content: string;
+    origin_server_ts: number;
+    unsigned: string | null;
+    depth: number;
+    auth_events: string;
+    prev_events: string;
+    hashes: string | null;
+    signatures: string | null;
+  }>();
+
+  return result.results.map(r => ({
+    event_id: r.event_id,
+    room_id: r.room_id,
+    sender: r.sender,
+    type: r.event_type,
+    state_key: r.state_key ?? undefined,
+    content: JSON.parse(r.content),
+    origin_server_ts: r.origin_server_ts,
+    unsigned: r.unsigned ? JSON.parse(r.unsigned) : undefined,
+    depth: r.depth,
+    auth_events: JSON.parse(r.auth_events),
+    prev_events: JSON.parse(r.prev_events),
+    hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
+    signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+  }));
+}
+
+// Get the auth chain for an event (all auth_events recursively)
+export async function getAuthChain(db: D1Database, eventIds: string[]): Promise<PDU[]> {
+  const seen = new Set<string>();
+  const chain: PDU[] = [];
+  const queue = [...eventIds];
+
+  while (queue.length > 0) {
+    const batch = queue.splice(0, 50).filter(id => !seen.has(id));
+    if (batch.length === 0) continue;
+
+    for (const id of batch) seen.add(id);
+
+    const events = await getEventsByIds(db, batch);
+    for (const event of events) {
+      chain.push(event);
+      for (const authId of event.auth_events) {
+        if (!seen.has(authId)) {
+          queue.push(authId);
+        }
+      }
+    }
+  }
+
+  return chain;
+}
+
+// Get the state at a specific event (by traversing auth chain)
+export async function getStateAtEvent(db: D1Database, eventId: string): Promise<PDU[]> {
+  const event = await getEvent(db, eventId);
+  if (!event) return [];
+
+  // Get the auth chain for this event's auth_events
+  const authEvents = await getEventsByIds(db, event.auth_events);
+
+  // Build current state from auth events
+  const stateMap = new Map<string, PDU>();
+  for (const authEvent of authEvents) {
+    if (authEvent.state_key !== undefined) {
+      stateMap.set(`${authEvent.type}\0${authEvent.state_key}`, authEvent);
+    }
+  }
+
+  return Array.from(stateMap.values());
+}
+
+// Get servers that share rooms with a user
+export async function getServersInRoomsWithUser(db: D1Database, userId: string): Promise<string[]> {
+  const result = await db.prepare(`
+    SELECT DISTINCT
+      CASE
+        WHEN INSTR(rm2.user_id, ':') > 0 THEN SUBSTR(rm2.user_id, INSTR(rm2.user_id, ':') + 1)
+        ELSE NULL
+      END as server_name
+    FROM room_memberships rm1
+    JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+    WHERE rm1.user_id = ?
+      AND rm1.membership = 'join'
+      AND rm2.membership = 'join'
+      AND rm2.user_id != ?
+  `).bind(userId, userId).all<{ server_name: string | null }>();
+
+  return result.results
+    .map(r => r.server_name)
+    .filter((s): s is string => s !== null);
+}
+
 // Notify all room members' SyncDurableObjects when a new event is stored
 // This wakes up any long-polling sync requests waiting for events
 export async function notifyUsersOfEvent(

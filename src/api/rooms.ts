@@ -6,6 +6,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, formatRoomAlias } from '../utils/ids';
 import { invalidateRoomCache } from '../services/room-cache';
+import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import {
   createRoom,
   getRoom,
@@ -104,7 +105,7 @@ async function createInitialRoomEvents(
     content: any,
     stateKey?: string
   ): Promise<string> {
-    const eventId = await generateEventId(serverName);
+    const eventId = await generateEventId(serverName, roomVersion);
     const event: PDU = {
       event_id: eventId,
       room_id: roomId,
@@ -293,9 +294,14 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     }
   }
 
+  // Validate room version
+  const version = room_version || getDefaultRoomVersion();
+  if (!isRoomVersionSupported(version)) {
+    return Errors.unsupportedRoomVersion(`Room version '${version}' is not supported`).toResponse();
+  }
+
   // Generate room ID
   const roomId = await generateRoomId(c.env.SERVER_NAME);
-  const version = room_version || '10';
 
   console.log('[createRoom] Creating room:', roomId, 'for user:', userId);
 
