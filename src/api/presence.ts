@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { getServersInRoomsWithUser } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -72,6 +73,36 @@ app.put('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
     }),
     { expirationTtl: 5 * 60 } // 5 minutes
   );
+
+  // Queue outbound m.presence EDUs to federated servers
+  try {
+    const remoteServers = await getServersInRoomsWithUser(db, requestingUserId);
+    const localServer = c.env.SERVER_NAME;
+    const uniqueServers = [...new Set(remoteServers)].filter(s => s !== localServer);
+
+    for (const server of uniqueServers) {
+      const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
+      await fedDO.fetch(new Request('http://internal/send-edu', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination: server,
+          edu_type: 'm.presence',
+          content: {
+            push: [{
+              user_id: requestingUserId,
+              presence,
+              status_msg: status_msg || undefined,
+              last_active_ago: 0,
+              currently_active: presence === 'online',
+            }],
+          },
+        }),
+      }));
+    }
+  } catch (err) {
+    console.warn('[presence] Failed to queue federation EDUs:', err);
+  }
 
   return c.json({});
 });

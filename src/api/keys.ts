@@ -175,6 +175,36 @@ app.post('/_matrix/client/v3/keys/upload', requireAuth(), async (c) => {
 
     // Record key change for /keys/changes
     await recordKeyChange(db, userId, deviceId, 'update');
+
+    // Queue outbound m.device_list_update EDUs to federated servers
+    try {
+      const { getServersInRoomsWithUser } = await import('../services/database');
+      const remoteServers = await getServersInRoomsWithUser(db, userId);
+      const localServer = c.env.SERVER_NAME;
+      const uniqueServers = [...new Set(remoteServers)].filter(s => s !== localServer);
+
+      for (const server of uniqueServers) {
+        const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
+        await fedDO.fetch(new Request('http://internal/send-edu', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            destination: server,
+            edu_type: 'm.device_list_update',
+            content: {
+              user_id: userId,
+              device_id: deviceId,
+              device_display_name: device_keys.unsigned?.device_display_name,
+              stream_id: Date.now(),
+              keys: device_keys,
+              deleted: false,
+            },
+          }),
+        }));
+      }
+    } catch (fedErr) {
+      console.warn('[keys] Failed to queue device list EDUs:', fedErr);
+    }
   }
 
   // Store one-time keys in KV for fast access

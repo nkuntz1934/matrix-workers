@@ -332,16 +332,19 @@ app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) =>
     return c.json({ results: [], limited: false });
   }
 
-  // Search for users by localpart, display name, or full user_id (exclude requesting user)
+  // Search for users using FTS5 for ranked full-text search
+  const ftsSearchTerm = searchTerm.replace(/['"*()]/g, ' ').trim();
   const results = await db.prepare(`
-    SELECT user_id, display_name, avatar_url
-    FROM users
-    WHERE is_deactivated = 0
-      AND is_guest = 0
-      AND user_id != ?
-      AND (localpart LIKE ? OR display_name LIKE ? OR user_id LIKE ?)
+    SELECT u.user_id, u.display_name, u.avatar_url
+    FROM users_fts fts
+    JOIN users u ON fts.user_id = u.user_id
+    WHERE users_fts MATCH ?
+      AND u.is_deactivated = 0
+      AND u.is_guest = 0
+      AND u.user_id != ?
+    ORDER BY bm25(users_fts)
     LIMIT ?
-  `).bind(requestingUserId, `%${searchTerm}%`, `%${searchTerm}%`, `%${searchTerm}%`, limit + 1).all<{
+  `).bind(ftsSearchTerm, requestingUserId, limit + 1).all<{
     user_id: string;
     display_name: string | null;
     avatar_url: string | null;

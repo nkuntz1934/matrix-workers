@@ -142,10 +142,7 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
     });
   }
 
-  // Build the search query
-  // We search in the content JSON for the search term
-  // SQLite doesn't have full-text search in D1, so we use LIKE
-  const searchPattern = `%${searchTerm}%`;
+  // Build the search query using FTS5 for ranked full-text search
   const limit = 50;
   let offset = 0;
 
@@ -155,16 +152,20 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
     } catch {}
   }
 
-  // Build query with filters
+  // Use FTS5 MATCH for full-text search with BM25 ranking
+  // Escape FTS5 special characters in search term
+  const ftsSearchTerm = searchTerm.replace(/['"*()]/g, ' ').trim();
+
   let query = `
-    SELECT e.event_id, e.event_type, e.room_id, e.sender, e.origin_server_ts, e.content
-    FROM events e
-    WHERE e.room_id IN (${searchRoomIds.map(() => '?').join(',')})
-      AND e.event_type = 'm.room.message'
-      AND e.content LIKE ?
+    SELECT e.event_id, e.event_type, e.room_id, e.sender, e.origin_server_ts, e.content,
+           bm25(events_fts) as rank
+    FROM events_fts fts
+    JOIN events e ON fts.event_id = e.event_id
+    WHERE fts.body MATCH ?
+      AND e.room_id IN (${searchRoomIds.map(() => '?').join(',')})
   `;
 
-  const params: any[] = [...searchRoomIds, searchPattern];
+  const params: any[] = [ftsSearchTerm, ...searchRoomIds];
 
   // Apply sender filter
   if (filter.senders && filter.senders.length > 0) {
@@ -189,10 +190,9 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
   }
 
   // Order by
-  if (orderBy === 'recent') {
-    query += ` ORDER BY e.origin_server_ts DESC`;
+  if (orderBy === 'rank') {
+    query += ` ORDER BY rank ASC`; // BM25 returns negative values, lower = better
   } else {
-    // For 'rank', we'd ideally use FTS ranking, but with LIKE we just use recency
     query += ` ORDER BY e.origin_server_ts DESC`;
   }
 
@@ -206,6 +206,7 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
     sender: string;
     origin_server_ts: number;
     content: string;
+    rank: number;
   }>();
 
   // Check if there are more results
@@ -215,12 +216,12 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
   // Get count (approximate for performance)
   const countQuery = `
     SELECT COUNT(*) as total
-    FROM events e
-    WHERE e.room_id IN (${searchRoomIds.map(() => '?').join(',')})
-      AND e.event_type = 'm.room.message'
-      AND e.content LIKE ?
+    FROM events_fts fts
+    JOIN events e ON fts.event_id = e.event_id
+    WHERE fts.body MATCH ?
+      AND e.room_id IN (${searchRoomIds.map(() => '?').join(',')})
   `;
-  const countResult = await db.prepare(countQuery).bind(...searchRoomIds, searchPattern).first<{ total: number }>();
+  const countResult = await db.prepare(countQuery).bind(ftsSearchTerm, ...searchRoomIds).first<{ total: number }>();
   const totalCount = countResult?.total || 0;
 
   // Build response
@@ -234,7 +235,7 @@ app.post('/_matrix/client/v3/search', requireAuth(), async (c) => {
 
     const result: SearchResult = {
       event_id: event.event_id,
-      rank: 1, // Simple ranking since we don't have FTS
+      rank: Math.abs(event.rank || 0),
       result: {
         event_id: event.event_id,
         type: event.event_type,

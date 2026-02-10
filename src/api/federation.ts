@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, PDU } from '../types';
 import { Errors } from '../utils/errors';
-import { generateSigningKeyPair, signJson, sha256, verifySignature } from '../utils/crypto';
+import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
   getRemoteKeysWithNotarySignature,
@@ -579,6 +579,23 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
+      // Verify content hash if present
+      if (pdu.hashes?.sha256) {
+        try {
+          const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
+          if (!hashValid) {
+            pduResults[eventId] = { error: 'Content hash mismatch' };
+            await c.env.DB.prepare(
+              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+               VALUES (?, ?, ?, ?, 0, ?)`
+            ).bind(eventId, pduOrigin, roomId, Date.now(), 'Content hash mismatch').run();
+            continue;
+          }
+        } catch (hashErr) {
+          console.warn(`[federation] Content hash check failed for ${eventId}:`, hashErr);
+        }
+      }
+
       // Check if the room exists locally
       const room = await c.env.DB.prepare(
         `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
@@ -710,13 +727,95 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           // In a full implementation, this would notify connected clients
           break;
 
-        case 'm.presence':
-          // Handle presence update
+        case 'm.presence': {
+          // Process inbound presence EDUs from federated servers
+          const presencePush = content?.push as Array<{
+            user_id: string;
+            presence: string;
+            status_msg?: string;
+            last_active_ago?: number;
+            currently_active?: boolean;
+          }> | undefined;
+          if (presencePush) {
+            for (const update of presencePush) {
+              if (update.user_id && update.presence) {
+                const now = Date.now();
+                const lastActive = update.last_active_ago
+                  ? now - update.last_active_ago
+                  : now;
+                try {
+                  await c.env.DB.prepare(`
+                    INSERT INTO presence (user_id, presence, status_msg, last_active_ts, currently_active)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                      presence = excluded.presence,
+                      status_msg = excluded.status_msg,
+                      last_active_ts = excluded.last_active_ts,
+                      currently_active = excluded.currently_active
+                  `).bind(
+                    update.user_id,
+                    update.presence,
+                    update.status_msg || null,
+                    lastActive,
+                    update.currently_active ? 1 : 0
+                  ).run();
+                } catch (presErr) {
+                  console.warn(`[federation] Failed to update presence for ${update.user_id}:`, presErr);
+                }
+              }
+            }
+          }
           break;
+        }
 
-        case 'm.device_list_update':
-          // Handle device list updates for E2EE
+        case 'm.device_list_update': {
+          // Process inbound device list update EDUs from federated servers
+          const deviceUserId = content?.user_id as string;
+          const deviceId = content?.device_id as string;
+          const streamId = (content?.stream_id as number) || 0;
+          const deviceKeys = content?.keys;
+          const deviceDisplayName = content?.device_display_name as string | undefined;
+          const deleted = content?.deleted as boolean;
+
+          if (deviceUserId && deviceId) {
+            try {
+              if (deleted) {
+                await c.env.DB.prepare(
+                  `DELETE FROM remote_device_lists WHERE user_id = ? AND device_id = ?`
+                ).bind(deviceUserId, deviceId).run();
+              } else {
+                await c.env.DB.prepare(`
+                  INSERT INTO remote_device_lists (user_id, device_id, device_display_name, keys, stream_id, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?)
+                  ON CONFLICT (user_id, device_id) DO UPDATE SET
+                    device_display_name = excluded.device_display_name,
+                    keys = excluded.keys,
+                    stream_id = excluded.stream_id,
+                    updated_at = excluded.updated_at
+                `).bind(
+                  deviceUserId,
+                  deviceId,
+                  deviceDisplayName || null,
+                  deviceKeys ? JSON.stringify(deviceKeys) : null,
+                  streamId,
+                  Date.now()
+                ).run();
+              }
+
+              // Update stream tracking
+              await c.env.DB.prepare(`
+                INSERT INTO remote_device_list_streams (user_id, stream_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                  stream_id = MAX(remote_device_list_streams.stream_id, excluded.stream_id),
+                  updated_at = excluded.updated_at
+              `).bind(deviceUserId, streamId, Date.now()).run();
+            } catch (devErr) {
+              console.warn(`[federation] Failed to update device list for ${deviceUserId}:`, devErr);
+            }
+          }
           break;
+        }
 
         case 'm.receipt':
           // Handle read receipts

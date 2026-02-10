@@ -7,6 +7,7 @@ import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, formatRoomAlias } from '../utils/ids';
 import { invalidateRoomCache } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
+import { calculateContentHash } from '../utils/crypto';
 import {
   createRoom,
   getRoom,
@@ -118,6 +119,10 @@ async function createInitialRoomEvents(
       auth_events: [...authEvents],
       prev_events: [...prevEvents],
     };
+
+    // Calculate and attach content hash
+    const hash = await calculateContentHash(event as unknown as Record<string, unknown>);
+    event.hashes = { sha256: hash };
 
     await storeEvent(db, event);
 

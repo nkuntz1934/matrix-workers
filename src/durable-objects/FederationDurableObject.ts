@@ -19,6 +19,13 @@ interface OutboundEvent {
   retry_count: number;
 }
 
+interface OutboundEdu {
+  edu_type: string;
+  destination: string;
+  content: any;
+  created_at: number;
+}
+
 export class FederationDurableObject extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -42,6 +49,10 @@ export class FederationDurableObject extends DurableObject<Env> {
 
     if (path === '/keys') {
       return this.handleKeys(request);
+    }
+
+    if (path === '/send-edu') {
+      return this.handleSendEdu(request);
     }
 
     return new Response('Not found', { status: 404 });
@@ -199,6 +210,31 @@ export class FederationDurableObject extends DurableObject<Env> {
     }), { status: 404 });
   }
 
+  // Queue an EDU for federation to a remote server
+  private async handleSendEdu(request: Request): Promise<Response> {
+    const data = await request.json() as {
+      destination: string;
+      edu_type: string;
+      content: any;
+    };
+
+    const edu: OutboundEdu = {
+      edu_type: data.edu_type,
+      destination: data.destination,
+      content: data.content,
+      created_at: Date.now(),
+    };
+
+    // Store in EDU queue
+    const key = `edu:${data.destination}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    await this.ctx.storage.put(key, edu);
+
+    // Try to send immediately
+    await this.processFederationQueue(data.destination);
+
+    return new Response('Queued');
+  }
+
   private async processFederationQueue(destination: string): Promise<void> {
     const prefix = `queue:${destination}:`;
     const allKeys = await this.ctx.storage.list({ prefix });
@@ -208,24 +244,38 @@ export class FederationDurableObject extends DurableObject<Env> {
       events.push(value as OutboundEvent);
     }
 
-    if (events.length === 0) return;
+    // Collect pending EDUs
+    const eduPrefix = `edu:${destination}:`;
+    const eduKeys = await this.ctx.storage.list({ prefix: eduPrefix });
+    const edus: OutboundEdu[] = [];
+    const eduKeyNames: string[] = [];
+    for (const [key, value] of eduKeys) {
+      edus.push(value as OutboundEdu);
+      eduKeyNames.push(key);
+    }
+
+    if (events.length === 0 && edus.length === 0) return;
 
     // Sort by creation time
     events.sort((a, b) => a.created_at - b.created_at);
+    edus.sort((a, b) => a.created_at - b.created_at);
 
     // Batch events for transmission
     const pdus = events.map(e => e.pdu);
+    const eduPayloads = edus.map(e => ({
+      edu_type: e.edu_type,
+      content: e.content,
+    }));
 
     try {
       const response = await fetch(`https://${destination}/_matrix/federation/v1/send/${Date.now()}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          // In production, add signature headers
         },
         body: JSON.stringify({
           pdus,
-          edus: [],
+          edus: eduPayloads,
         }),
       });
 
@@ -233,6 +283,10 @@ export class FederationDurableObject extends DurableObject<Env> {
         // Remove sent events from queue
         for (const event of events) {
           await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+        }
+        // Remove sent EDUs
+        for (const key of eduKeyNames) {
+          await this.ctx.storage.delete(key);
         }
 
         // Update server status
