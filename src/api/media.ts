@@ -186,28 +186,43 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return new Response(object.body, { headers });
   }
 
-  // Use Cloudflare Image Resizing if available (requires Cloudflare Pro+)
-  // For now, return original with appropriate cache headers
-  // The client will handle resizing
-  //
-  // In the future, you can use:
-  // const resizedUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
-  // return fetch(resizedUrl, {
-  //   cf: {
-  //     image: {
-  //       width,
-  //       height,
-  //       fit: method === 'crop' ? 'cover' : 'contain',
-  //       format: 'jpeg',
-  //       quality: 85
-  //     }
-  //   }
-  // });
+  // Use Cloudflare Image Resizing via cf.image on fetch
+  try {
+    const downloadUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+    const resized = await fetch(downloadUrl, {
+      cf: {
+        image: {
+          width,
+          height,
+          fit: method === 'crop' ? 'cover' : 'contain',
+          format: 'jpeg',
+          quality: 85,
+        },
+      },
+    });
 
+    if (resized.ok) {
+      // Cache the thumbnail in R2 for future requests
+      const thumbBody = await resized.arrayBuffer();
+      await c.env.MEDIA.put(thumbnailKey, thumbBody, {
+        httpMetadata: { contentType: 'image/jpeg' },
+      });
+
+      const headers = new Headers();
+      headers.set('Content-Type', 'image/jpeg');
+      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+      headers.set('X-Thumbnail-Generated', 'true');
+      return new Response(thumbBody, { headers });
+    }
+  } catch (resizeErr) {
+    // Image Resizing may not be available on Free plan - fall back to original
+    console.warn('[media] Image resize failed (may require Pro plan):', resizeErr);
+  }
+
+  // Fallback: return original
   const headers = new Headers();
   headers.set('Content-Type', metadata.content_type);
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  // Add hint that this is the original, not a thumbnail
   headers.set('X-Thumbnail-Generated', 'false');
 
   return new Response(object.body, { headers });
@@ -284,7 +299,26 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
       return c.json({});
     }
 
-    const html = await response.text();
+    let html: string;
+
+    // Try Browser Rendering for JS-rendered pages (if available)
+    if (c.env.BROWSER) {
+      try {
+        const browserResponse = await c.env.BROWSER.fetch(new Request(url, {
+          headers: { 'Accept': 'text/html' },
+        }));
+        if (browserResponse.ok) {
+          html = await browserResponse.text();
+        } else {
+          html = await response.text();
+        }
+      } catch (browserErr) {
+        console.warn('[media] Browser Rendering failed, falling back to basic fetch:', browserErr);
+        html = await response.text();
+      }
+    } else {
+      html = await response.text();
+    }
 
     // Extract Open Graph and meta tags
     const preview: Record<string, any> = {};
@@ -581,6 +615,39 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
+  }
+
+  // Try Image Resizing for image content
+  if (isImage) {
+    try {
+      const downloadUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+      const resized = await fetch(downloadUrl, {
+        cf: {
+          image: {
+            width,
+            height,
+            fit: method === 'crop' ? 'cover' : 'contain',
+            format: 'jpeg',
+            quality: 85,
+          },
+        },
+      });
+
+      if (resized.ok) {
+        const thumbBody = await resized.arrayBuffer();
+        await c.env.MEDIA.put(thumbnailKey, thumbBody, {
+          httpMetadata: { contentType: 'image/jpeg' },
+        });
+
+        const resHeaders = new Headers();
+        resHeaders.set('Content-Type', 'image/jpeg');
+        resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
+        resHeaders.set('X-Thumbnail-Generated', 'true');
+        return new Response(thumbBody, { headers: resHeaders });
+      }
+    } catch (resizeErr) {
+      console.warn('[media] Image resize failed:', resizeErr);
+    }
   }
 
   const headers = new Headers();

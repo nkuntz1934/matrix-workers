@@ -73,6 +73,15 @@ export interface Env {
   // Email Service Configuration (Resend)
   RESEND_API_KEY?: string;   // Resend API key for email verification
   EMAIL_FROM?: string;       // From address for verification emails (e.g., "noreply@m.example.com")
+
+  // Browser Rendering (for URL previews of JS-rendered pages)
+  BROWSER?: Fetcher;
+
+  // Analytics Engine (for server metrics)
+  ANALYTICS?: AnalyticsEngineDataset;
+
+  // Workers AI (for embeddings and content moderation)
+  AI?: Ai;
 }
 
 // Variables set by middleware and available via c.get()

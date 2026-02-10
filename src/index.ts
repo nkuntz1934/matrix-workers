@@ -44,12 +44,13 @@ import oauth from './api/oauth';
 import { adminDashboardHtml } from './admin/dashboard';
 import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth } from './middleware/auth';
+import { analyticsMiddleware } from './middleware/analytics';
 
 // Import Durable Objects
 export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
 
 // Import Workflows
-export { RoomJoinWorkflow, PushNotificationWorkflow } from './workflows';
+export { RoomJoinWorkflow, PushNotificationWorkflow, FederationCatchupWorkflow, MediaCleanupWorkflow, StateCompactionWorkflow } from './workflows';
 
 // Create the main app
 const app = new Hono<AppEnv>();
@@ -66,6 +67,7 @@ app.use('*', cors({
 
 // Global middleware
 app.use('*', logger());
+app.use('*', analyticsMiddleware());
 
 // Rate limiting for Matrix API endpoints
 app.use('/_matrix/*', rateLimitMiddleware);

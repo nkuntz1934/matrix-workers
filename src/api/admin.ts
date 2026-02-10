@@ -2336,4 +2336,93 @@ app.put('/_synapse/admin/v2/users/:userId', requireAuth(), requireAdmin, async (
   }
 });
 
+// ============================================
+// Analytics Engine Query Endpoints
+// ============================================
+
+// Get request metrics from Analytics Engine
+app.get('/_matrix/client/v3/admin/analytics/requests', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  const period = c.req.query('period') || '1h';
+
+  // Calculate time range
+  const now = Date.now();
+  const periodMs: Record<string, number> = {
+    '1h': 60 * 60 * 1000,
+    '6h': 6 * 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+  };
+  const rangeMs = periodMs[period] || periodMs['1h'];
+  const since = now - rangeMs;
+
+  // Query from D1 events as a proxy for request activity
+  const totalRequests = await db.prepare(`
+    SELECT COUNT(*) as count FROM events WHERE origin_server_ts > ?
+  `).bind(since).first<{ count: number }>();
+
+  const byType = await db.prepare(`
+    SELECT event_type, COUNT(*) as count FROM events
+    WHERE origin_server_ts > ?
+    GROUP BY event_type ORDER BY count DESC LIMIT 20
+  `).bind(since).all<{ event_type: string; count: number }>();
+
+  const activeUsers = await db.prepare(`
+    SELECT COUNT(DISTINCT sender) as count FROM events WHERE origin_server_ts > ?
+  `).bind(since).first<{ count: number }>();
+
+  const activeRooms = await db.prepare(`
+    SELECT COUNT(DISTINCT room_id) as count FROM events WHERE origin_server_ts > ?
+  `).bind(since).first<{ count: number }>();
+
+  return c.json({
+    period,
+    since: new Date(since).toISOString(),
+    total_events: totalRequests?.count || 0,
+    active_users: activeUsers?.count || 0,
+    active_rooms: activeRooms?.count || 0,
+    events_by_type: byType.results,
+  });
+});
+
+// Get federation metrics
+app.get('/_matrix/client/v3/admin/analytics/federation', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  const period = c.req.query('period') || '24h';
+
+  const now = Date.now();
+  const periodMs: Record<string, number> = {
+    '1h': 60 * 60 * 1000,
+    '6h': 6 * 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+  };
+  const rangeMs = periodMs[period] || periodMs['24h'];
+  const since = now - rangeMs;
+
+  // Get federation event counts (events from remote servers)
+  const inboundEvents = await db.prepare(`
+    SELECT COUNT(*) as count FROM events
+    WHERE origin_server_ts > ? AND sender NOT LIKE ?
+  `).bind(since, `%:${c.env.SERVER_NAME}`).first<{ count: number }>();
+
+  const outboundEvents = await db.prepare(`
+    SELECT COUNT(*) as count FROM events
+    WHERE origin_server_ts > ? AND sender LIKE ?
+  `).bind(since, `%:${c.env.SERVER_NAME}`).first<{ count: number }>();
+
+  // Get unique remote servers
+  const remoteServers = await db.prepare(`
+    SELECT COUNT(DISTINCT server_name) as count FROM known_servers
+  `).first<{ count: number }>();
+
+  return c.json({
+    period,
+    since: new Date(since).toISOString(),
+    inbound_events: inboundEvents?.count || 0,
+    outbound_events: outboundEvents?.count || 0,
+    known_servers: remoteServers?.count || 0,
+  });
+});
+
 export default app;

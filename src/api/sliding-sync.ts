@@ -7,6 +7,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
+import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
 
@@ -623,51 +624,10 @@ async function getRoomData(
     result.limited = hasMoreEvents;
   }
 
-  // Get notification counts based on m.fully_read marker
-  // Count message events after the user's read marker (excluding their own messages)
-  result.notification_count = 0;
-  result.highlight_count = 0;
-
-  // Get user's m.fully_read marker for this room
-  const fullyReadMarker = await db.prepare(`
-    SELECT content FROM account_data
-    WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'
-  `).bind(userId, roomId).first<{ content: string }>();
-
-  if (fullyReadMarker) {
-    try {
-      const markerContent = JSON.parse(fullyReadMarker.content);
-      const readEventId = markerContent.event_id;
-
-      // Get the stream_ordering of the read marker event
-      const readEvent = await db.prepare(`
-        SELECT stream_ordering FROM events WHERE event_id = ?
-      `).bind(readEventId).first<{ stream_ordering: number }>();
-
-      if (readEvent?.stream_ordering) {
-        // Count message events after the read marker that are not from the user
-        const unreadCount = await db.prepare(`
-          SELECT COUNT(*) as count FROM events
-          WHERE room_id = ?
-            AND stream_ordering > ?
-            AND sender != ?
-            AND event_type IN ('m.room.message', 'm.room.encrypted')
-        `).bind(roomId, readEvent.stream_ordering, userId).first<{ count: number }>();
-
-        result.notification_count = unreadCount?.count || 0;
-      }
-    } catch { /* ignore parse errors */ }
-  } else {
-    // No read marker = count all messages from others
-    const unreadCount = await db.prepare(`
-      SELECT COUNT(*) as count FROM events
-      WHERE room_id = ?
-        AND sender != ?
-        AND event_type IN ('m.room.message', 'm.room.encrypted')
-    `).bind(roomId, userId).first<{ count: number }>();
-
-    result.notification_count = unreadCount?.count || 0;
-  }
+  // Get notification and highlight counts using push rule evaluation
+  const counts = await countNotificationsWithRules(db, userId, roomId);
+  result.notification_count = counts.notification_count;
+  result.highlight_count = counts.highlight_count;
 
   // Get last activity timestamp
   const lastEvent = await db.prepare(`
