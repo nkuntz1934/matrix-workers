@@ -51,7 +51,7 @@ npx wrangler r2 bucket create my-matrix-media
 
 ### Email Verification (Optional)
 
-For 3PID email verification support, configure [Cloudflare Email Service](https://developers.cloudflare.com/email-service/):
+For 3PID email verification support, configure [Cloudflare Email Service](https://developers.cloudflare.com/email-service/) (currently in closed beta):
 
 1. In the Cloudflare dashboard, go to **Compute & AI > Email Service > Email Sending**
 2. Select **Onboard Domain** and choose your domain (must use Cloudflare DNS)
