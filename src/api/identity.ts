@@ -160,7 +160,7 @@ app.post('/_matrix/identity/v2/validate/email/requestToken', async (c) => {
     Date.now() + (24 * 60 * 60 * 1000)
   ).run();
 
-  // TODO: Send email via Resend service (requires RESEND_API_KEY)
+  // TODO: Send email via Cloudflare Email Service (requires EMAIL binding)
 
   return c.json({ sid: sessionId });
 });

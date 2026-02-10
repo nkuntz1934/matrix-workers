@@ -70,8 +70,8 @@ export interface Env {
   ROOM_JOIN_WORKFLOW: Workflow;
   PUSH_NOTIFICATION_WORKFLOW: Workflow;
 
-  // Email Service Configuration (Resend)
-  RESEND_API_KEY?: string;   // Resend API key for email verification
+  // Email Service Configuration (Cloudflare Email Service)
+  EMAIL?: SendEmail;         // Cloudflare Email Service binding
   EMAIL_FROM?: string;       // From address for verification emails (e.g., "noreply@m.example.com")
 
   // Browser Rendering (for URL previews of JS-rendered pages)

@@ -135,8 +135,7 @@
   // npx wrangler secret put CALLS_APP_SECRET
   // npx wrangler secret put LIVEKIT_API_SECRET
   //
-  // For email verification (3PID) via Resend:
-  // npx wrangler secret put RESEND_API_KEY   # API key from resend.com
+  // For email verification (3PID) via Cloudflare Email Service:
   // npx wrangler secret put EMAIL_FROM       # From address (e.g., "noreply@m.easydemo.org")
   //
   // For direct APNs push notifications (optional - bypasses Sygnal):
@@ -166,6 +165,9 @@
       "service_id": "019b6a8b-4d9e-7751-bef5-7d9a3f1807a9"
     }
   ],
+
+  // Cloudflare Email Service for 3PID email verification
+  "send_email": [{ "name": "EMAIL", "remote": true }],
 
   // Cloudflare Workflows for durable multi-step operations
   "workflows": [

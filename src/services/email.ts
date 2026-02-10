@@ -1,13 +1,7 @@
-// Email Service using Resend API
+// Email Service using Cloudflare Email Service
 // Used for 3PID email verification
 
 import type { Env } from '../types/env';
-
-interface ResendEmailResponse {
-  id?: string;
-  error?: string;
-  message?: string;
-}
 
 /**
  * Generate a 6-digit verification code
@@ -32,7 +26,7 @@ export async function generateSessionId(): Promise<string> {
 }
 
 /**
- * Send a verification email with a 6-digit code via Resend API
+ * Send a verification email with a 6-digit code via Cloudflare Email Service
  */
 export async function sendVerificationEmail(
   env: Env,
@@ -40,11 +34,10 @@ export async function sendVerificationEmail(
   token: string,
   serverName: string
 ): Promise<{ success: boolean; error?: string }> {
-  const apiKey = env.RESEND_API_KEY;
   const fromEmail = env.EMAIL_FROM || `noreply@${serverName}`;
 
-  if (!apiKey) {
-    console.error('RESEND_API_KEY is not configured');
+  if (!env.EMAIL) {
+    console.error('EMAIL binding is not configured');
     return { success: false, error: 'Email service not configured' };
   }
 
@@ -92,32 +85,15 @@ This email was sent from ${serverName}
 `;
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from: fromEmail,
-        to: [toEmail],
-        subject,
-        html: htmlContent,
-        text: textContent,
-      }),
+    const result = await env.EMAIL.send({
+      from: fromEmail,
+      to: toEmail,
+      subject,
+      html: htmlContent,
+      text: textContent,
     });
 
-    const result = await response.json() as ResendEmailResponse;
-
-    if (!response.ok) {
-      console.error('Resend API error:', result);
-      return {
-        success: false,
-        error: result.message || result.error || 'Failed to send email'
-      };
-    }
-
-    console.log(`Verification email sent to ${toEmail}, message id: ${result.id}`);
+    console.log(`Verification email sent to ${toEmail}, message id: ${result.messageId}`);
     return { success: true };
   } catch (error) {
     console.error('Error sending verification email:', error);

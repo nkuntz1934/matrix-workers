@@ -51,18 +51,17 @@ npx wrangler r2 bucket create my-matrix-media
 
 ### Email Verification (Optional)
 
-For 3PID email verification support, configure [Resend](https://resend.com):
+For 3PID email verification support, configure [Cloudflare Email Service](https://developers.cloudflare.com/email-service/):
+
+1. In the Cloudflare dashboard, go to **Compute & AI > Email Service > Email Sending**
+2. Select **Onboard Domain** and choose your domain (must use Cloudflare DNS)
+3. Wait for SPF/DKIM DNS records to propagate (typically 5–15 minutes)
+4. Set the from address secret:
 
 ```bash
-# Set your Resend API key
-npx wrangler secret put RESEND_API_KEY
-
-# Set the from email address (must match your verified domain)
 npx wrangler secret put EMAIL_FROM
 # Example: noreply@m.easydemo.org
 ```
-
-> **Note:** Cloudflare's native [Email Workers](https://developers.cloudflare.com/email-routing/email-workers/send-email-workers/) currently only support sending to pre-verified destination addresses, making them unsuitable for verification emails to arbitrary users. Resend is used as a workaround until Cloudflare releases transactional email support for Workers.
 
 ## Spec Compliance
 
@@ -165,7 +164,7 @@ npx wrangler secret put EMAIL_FROM
 | Discovery | `.well-known/matrix/*` (client, server, support) | ✅ |
 | Reporting | Report events, rooms, users | ✅ |
 | Admin | User session info (`/admin/whois`), full admin API | ✅ |
-| 3PID | Email verification, 3PID management | ✅ (Resend) |
+| 3PID | Email verification, 3PID management | ✅ |
 | Timestamps | `timestamp_to_event` for event lookup | ✅ |
 
 ### Server-Server (Federation) API
