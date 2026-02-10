@@ -36,6 +36,8 @@ import serverNotices from './api/server-notices';
 import report from './api/report';
 import calls from './api/calls';
 import rtc from './api/rtc';
+import appservice from './api/appservice';
+import identity from './api/identity';
 // import qrLogin from './api/qr-login'; // QR feature commented out - requires MSC4108/OIDC for Element X
 import oidcAuth from './api/oidc-auth';
 import oauth from './api/oauth';
@@ -142,6 +144,12 @@ app.route('/', calls);
 
 // MatrixRTC (LiveKit) JWT service for Element X calls
 app.route('/', rtc);
+
+// Application Service API
+app.route('/', appservice);
+
+// Identity Service API
+app.route('/', identity);
 
 // Server-Server (Federation) API
 app.route('/', federation);

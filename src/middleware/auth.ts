@@ -5,6 +5,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { hashToken } from '../utils/crypto';
 import { getUserByTokenHash } from '../services/database';
+import { getAppServiceByToken } from '../services/appservice';
 
 export type AuthContext = {
   userId: string;
@@ -69,7 +70,28 @@ export function requireAuth() {
     const tokenPrefix = token.substring(0, 8);
     console.log(`[AUTH] Validating token ${tokenPrefix}... for ${path}`);
 
-    const auth = await validateAccessToken(c.env.DB, token);
+    let auth = await validateAccessToken(c.env.DB, token);
+
+    // If normal token validation fails, try app service token
+    if (!auth) {
+      try {
+        const appservice = await getAppServiceByToken(c.env.DB, token);
+        if (appservice) {
+          // AS can act as its sender user or as a user specified by user_id query param
+          const url = new URL(c.req.url);
+          const asUserId = url.searchParams.get('user_id');
+          const serverName = c.env.SERVER_NAME;
+          const senderUserId = asUserId || `@${appservice.sender_localpart}:${serverName}`;
+          auth = {
+            userId: senderUserId,
+            deviceId: null,
+            accessToken: token,
+          };
+        }
+      } catch (asErr) {
+        // Ignore AS token lookup errors
+      }
+    }
 
     if (!auth) {
       console.log(`[AUTH] Token ${tokenPrefix}... is INVALID for ${path}. Token length: ${token.length}`);
