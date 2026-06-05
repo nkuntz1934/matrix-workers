@@ -81,6 +81,14 @@ npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/005_idp_provider
 npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/006_query_optimization.sql
 npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/007_secure_server_keys.sql
 npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/008_federation_transactions.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/009_reports_extended.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/010_fix_reports_schema.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/011_identity_service.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/012_fts_search.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/013_remote_device_lists.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/014_appservice.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/015_identity_associations.sql
+npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/016_event_relations_backfill.sql
 ```
 
 #### 3. Configure Custom Domain
@@ -331,6 +339,14 @@ npx wrangler d1 execute my-matrix-db --remote --file=migrations/005_idp_provider
 npx wrangler d1 execute my-matrix-db --remote --file=migrations/006_query_optimization.sql
 npx wrangler d1 execute my-matrix-db --remote --file=migrations/007_secure_server_keys.sql
 npx wrangler d1 execute my-matrix-db --remote --file=migrations/008_federation_transactions.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/009_reports_extended.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/010_fix_reports_schema.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/011_identity_service.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/012_fts_search.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/013_remote_device_lists.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/014_appservice.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/015_identity_associations.sql
+npx wrangler d1 execute my-matrix-db --remote --file=migrations/016_event_relations_backfill.sql
 ```
 
 Each migration should complete with "success": true.

@@ -1,6 +1,6 @@
 // Matrix room endpoints
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { AppEnv, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
@@ -747,8 +747,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/state', requireAuth(), async (c) => {
   return c.json(clientEvents);
 });
 
-// GET /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Get specific state
-app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+async function handleGetSpecificState(c: Context<AppEnv>) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -766,10 +765,18 @@ app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   }
 
   return c.json(event.content);
-});
+}
 
-// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Set state
-app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+// GET /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey - Get specific state
+app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey', requireAuth(), handleGetSpecificState);
+
+// GET /_matrix/client/v3/rooms/:roomId/state/:eventType/ - Get specific state with empty state_key
+app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/', requireAuth(), handleGetSpecificState);
+
+// GET /_matrix/client/v3/rooms/:roomId/state/:eventType - Get specific state with omitted empty state_key
+app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType', requireAuth(), handleGetSpecificState);
+
+async function handlePutState(c: Context<AppEnv>) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -840,7 +847,16 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
 
   return c.json({ event_id: eventId });
-});
+}
+
+// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey - Set state
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey', requireAuth(), handlePutState);
+
+// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/ - Set state with empty state_key
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/', requireAuth(), handlePutState);
+
+// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType - Set state with omitted empty state_key
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType', requireAuth(), handlePutState);
 
 // GET /_matrix/client/v3/rooms/:roomId/members - Get room members
 app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => {

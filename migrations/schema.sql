@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS event_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_relations_target ON event_relations(relates_to_id);
 CREATE INDEX IF NOT EXISTS idx_relations_type ON event_relations(relation_type);
+CREATE INDEX IF NOT EXISTS idx_relations_target_type ON event_relations(relates_to_id, relation_type);
 
 -- Push rules (per-user notification settings)
 CREATE TABLE IF NOT EXISTS push_rules (

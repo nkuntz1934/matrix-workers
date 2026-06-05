@@ -289,6 +289,26 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     ).bind(event.room_id, event.type, event.state_key, event.event_id).run();
   }
 
+  const relatesTo = event.content['m.relates_to'];
+  if (relatesTo && typeof relatesTo === 'object' && !Array.isArray(relatesTo)) {
+    const relation = relatesTo as Record<string, unknown>;
+    const relatesToId = relation.event_id;
+    const relationType = relation.rel_type;
+    const aggregationKey = relation.key;
+
+    if (typeof relatesToId === 'string' && typeof relationType === 'string') {
+      await db.prepare(`
+        INSERT OR REPLACE INTO event_relations (event_id, relates_to_id, relation_type, aggregation_key)
+        VALUES (?, ?, ?, ?)
+      `).bind(
+        event.event_id,
+        relatesToId,
+        relationType,
+        typeof aggregationKey === 'string' ? aggregationKey : null
+      ).run();
+    }
+  }
+
   return streamOrdering;
 }
 

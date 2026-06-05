@@ -54,7 +54,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
   let query = `
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ?
+    JOIN event_relations er ON er.event_id = e.event_id
+    WHERE e.room_id = ? AND er.relates_to_id = ?
   `;
   const params: any[] = [roomId, eventId];
 
@@ -124,7 +125,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ?
+    JOIN event_relations er ON er.event_id = e.event_id
+    WHERE e.room_id = ? AND er.relates_to_id = ? AND er.relation_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
   `).bind(roomId, eventId, relType, limit + 1).all<{
@@ -181,7 +183,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ? AND e.event_type = ?
+    JOIN event_relations er ON er.event_id = e.event_id
+    WHERE e.room_id = ? AND er.relates_to_id = ? AND er.relation_type = ? AND e.event_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
   `).bind(roomId, eventId, relType, eventType, limit + 1).all<{
@@ -236,15 +239,22 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
     WHERE e.room_id = ? AND e.event_id IN (
-      SELECT DISTINCT relates_to_event_id FROM events
-      WHERE room_id = ? AND relation_type = 'm.thread'
+      SELECT DISTINCT er.relates_to_id
+      FROM event_relations er
+      JOIN events child ON child.event_id = er.event_id
+      WHERE child.room_id = ? AND er.relation_type = 'm.thread'
     )
   `;
   const params: any[] = [roomId, roomId];
 
   if (include === 'participated') {
     query += ` AND (e.sender = ? OR EXISTS (
-      SELECT 1 FROM events r WHERE r.relates_to_event_id = e.event_id AND r.sender = ?
+      SELECT 1
+      FROM event_relations er2
+      JOIN events r ON r.event_id = er2.event_id
+      WHERE er2.relates_to_id = e.event_id
+        AND er2.relation_type = 'm.thread'
+        AND r.sender = ?
     ))`;
     params.push(userId, userId);
   }
