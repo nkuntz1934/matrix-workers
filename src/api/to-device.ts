@@ -9,7 +9,7 @@
 // Messages are delivered via /sync and sliding sync extensions
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 
@@ -61,6 +61,79 @@ async function getUserDevices(db: D1Database, userId: string): Promise<string[]>
   return devices.results.map(d => d.device_id);
 }
 
+function makeToDeviceMessageId(
+  senderUserId: string,
+  txnId: string,
+  recipientUserId: string,
+  targetDeviceId: string,
+  eventType: string
+): string {
+  // One Matrix to-device transaction contains at most one message per
+  // recipient device for a given event type. Deterministic IDs make retries
+  // idempotent even if notification wakeup failed before the txn was stored.
+  return `to_device:${senderUserId}:${txnId}:${recipientUserId}:${targetDeviceId}:${eventType}`;
+}
+
+function escapeSqlLike(value: string): string {
+  return value.replace(/[!%_]/g, char => `!${char}`);
+}
+
+async function getPendingRecipientsForTransaction(
+  db: D1Database,
+  senderUserId: string,
+  txnId: string
+): Promise<string[]> {
+  const messagePrefix = escapeSqlLike(`to_device:${senderUserId}:${txnId}:`) + '%';
+  const rows = await db.prepare(`
+    SELECT DISTINCT recipient_user_id
+    FROM to_device_messages
+    WHERE sender_user_id = ?
+      AND delivered = 0
+      AND message_id LIKE ? ESCAPE '!'
+  `).bind(senderUserId, messagePrefix).all<{ recipient_user_id: string }>();
+
+  return rows.results.map(row => row.recipient_user_id);
+}
+
+async function notifyToDeviceRecipients(
+  env: Env,
+  recipientUserIds: Iterable<string>,
+  senderUserId: string,
+  eventType: string,
+  txnId: string
+): Promise<boolean> {
+  const uniqueRecipients = [...new Set(recipientUserIds)].filter(Boolean);
+  if (uniqueRecipients.length === 0) {
+    return true;
+  }
+
+  const results = await Promise.all(uniqueRecipients.map(async (recipientUserId) => {
+    try {
+      const timestamp = Date.now();
+      const syncDO = env.SYNC.get(env.SYNC.idFromName(recipientUserId));
+      const response = await syncDO.fetch(new Request('http://internal/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event_id: `to_device:${senderUserId}:${eventType}:${txnId}:${recipientUserId}:${crypto.randomUUID()}`,
+          room_id: '',
+          type: eventType,
+          timestamp,
+        }),
+      }));
+      if (!response.ok) {
+        throw new Error(`Sync notify failed with status ${response.status}`);
+      }
+      return true;
+    } catch (error) {
+      console.error('[to-device] Failed to notify recipient sync:', recipientUserId, error);
+      return false;
+    }
+  }));
+
+  return results.every(Boolean);
+}
+
 // ============================================
 // Endpoints
 // ============================================
@@ -78,6 +151,9 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   `).bind(userId, txnId).first<{ response: string }>();
 
   if (existingTxn) {
+    const pendingRecipients = await getPendingRecipientsForTransaction(db, userId, txnId);
+    await notifyToDeviceRecipients(c.env, pendingRecipients, userId, eventType, txnId);
+
     // Return cached response for idempotency
     return c.json(JSON.parse(existingTxn.response || '{}'));
   }
@@ -92,6 +168,8 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   if (!body.messages) {
     return Errors.missingParam('messages').toResponse();
   }
+
+  const recipientsToNotify = new Set<string>();
 
   // Process each recipient user
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
@@ -109,7 +187,7 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
       // Create a message for each target device
       for (const targetDeviceId of targetDevices) {
         const streamPosition = await getNextStreamPosition(db, 'to_device');
-        const messageId = `${userId}_${txnId}_${recipientUserId}_${targetDeviceId}_${Date.now()}`;
+        const messageId = makeToDeviceMessageId(userId, txnId, recipientUserId, targetDeviceId, eventType);
 
         await db.prepare(`
           INSERT INTO to_device_messages (
@@ -126,16 +204,28 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
           messageId,
           streamPosition
         ).run();
+        recipientsToNotify.add(recipientUserId);
       }
     }
   }
 
-  // Store transaction for idempotency
-  await db.prepare(`
-    INSERT INTO transaction_ids (user_id, txn_id, response)
-    VALUES (?, ?, '{}')
-    ON CONFLICT (user_id, txn_id) DO NOTHING
-  `).bind(userId, txnId).run();
+  const notified = await notifyToDeviceRecipients(c.env, recipientsToNotify, userId, eventType, txnId);
+  if (notified) {
+    // Store transaction for idempotency only after wakeups were accepted. If a
+    // wakeup failed, a client retry will hit deterministic message IDs and try
+    // the notify path again without duplicating stored messages.
+    await db.prepare(`
+      INSERT INTO transaction_ids (user_id, txn_id, response)
+      VALUES (?, ?, '{}')
+      ON CONFLICT (user_id, txn_id) DO NOTHING
+    `).bind(userId, txnId).run();
+  } else {
+    console.warn('[to-device] Not storing transaction id after failed sync wakeup', {
+      userId,
+      txnId,
+      eventType,
+    });
+  }
 
   return c.json({});
 });
@@ -219,23 +309,17 @@ export async function getToDeviceMessages(
     content: JSON.parse(msg.content),
   }));
 
-  // Get the current max stream position for to-device messages
-  // This ensures we always return a valid next_batch, even on first sync
-  const currentPos = await db.prepare(`
-    SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM to_device_messages
-  `).first<{ max_pos: number }>();
-  const maxStreamPos = currentPos?.max_pos || 0;
-
   // Return the appropriate next_batch:
   // - If we returned messages: use the max position of those messages
-  // - Otherwise: use the current max stream position (client is caught up)
+  // - Otherwise: keep the device cursor unchanged. Advancing to the global
+  //   to-device max can skip messages that belong to other devices now and
+  //   messages for this device that race in after the empty query.
   let nextBatch: string;
   if (messages.results.length > 0) {
     const maxReturnedPos = Math.max(...messages.results.map(m => m.stream_position));
     nextBatch = String(maxReturnedPos);
   } else {
-    // No messages to return - use current max position so client knows where we are
-    nextBatch = String(maxStreamPos);
+    nextBatch = String(sincePos);
   }
 
   return { events, nextBatch };

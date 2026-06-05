@@ -749,21 +749,27 @@ export async function notifyUsersOfEvent(
   env: Env,
   roomId: string,
   eventId: string,
-  eventType: string
+  eventType: string,
+  extraUserIds: string[] = []
 ): Promise<void> {
   try {
-    // Get all joined members of the room
+    // Get joined members of the room and add explicit targets for membership
+    // changes where the target is not joined yet/anymore (invite, leave, ban).
     const members = await env.DB.prepare(
       `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'`
     ).bind(roomId).all<{ user_id: string }>();
+    const userIds = [...new Set([
+      ...members.results.map(member => member.user_id),
+      ...extraUserIds.filter(Boolean),
+    ])];
 
-    console.log('[database] Notifying', members.results.length, 'users of event', eventId,
-      'users:', members.results.map(m => m.user_id).join(', '));
+    console.log('[database] Notifying', userIds.length, 'users of event', eventId,
+      'users:', userIds.join(', '));
 
     // Notify each user's SyncDurableObject in parallel
-    const notifications = members.results.map(async (member) => {
+    const notifications = userIds.map(async (userId) => {
       try {
-        const syncDO = env.SYNC.get(env.SYNC.idFromName(member.user_id));
+        const syncDO = env.SYNC.get(env.SYNC.idFromName(userId));
         await syncDO.fetch(new Request('http://internal/notify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -776,7 +782,7 @@ export async function notifyUsersOfEvent(
         }));
       } catch (error) {
         // Don't fail the whole operation if one notification fails
-        console.error(`[database] Failed to notify user ${member.user_id} of event:`, error);
+        console.error(`[database] Failed to notify user ${userId} of event:`, error);
       }
     });
 

@@ -328,7 +328,7 @@ app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) =>
     return c.json({ errcode: 'M_BAD_JSON', error: 'Invalid JSON' }, 400);
   }
 
-  const searchTerm = body.search_term || '';
+  const searchTerm = (body.search_term || '').trim();
   const limit = Math.min(body.limit || 10, 50);
 
   console.log('[user_directory] Search request:', {
@@ -342,27 +342,114 @@ app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) =>
     return c.json({ results: [], limited: false });
   }
 
-  // Search for users using FTS5 for ranked full-text search
-  const ftsSearchTerm = searchTerm.replace(/['"*()]/g, ' ').trim();
-  const results = await db.prepare(`
-    SELECT u.user_id, u.display_name, u.avatar_url
-    FROM users_fts fts
-    JOIN users u ON fts.user_id = u.user_id
-    WHERE users_fts MATCH ?
-      AND u.is_deactivated = 0
-      AND u.is_guest = 0
-      AND u.user_id != ?
-    ORDER BY bm25(users_fts)
-    LIMIT ?
-  `).bind(ftsSearchTerm, requestingUserId, limit + 1).all<{
+  type DirectoryUser = {
     user_id: string;
     display_name: string | null;
     avatar_url: string | null;
-  }>();
+  };
 
-  const limited = results.results.length > limit;
+  const usersById = new Map<string, DirectoryUser>();
+  const addUsers = (rows: DirectoryUser[]) => {
+    for (const user of rows) {
+      if (user.user_id !== requestingUserId && !usersById.has(user.user_id)) {
+        usersById.set(user.user_id, user);
+      }
+    }
+  };
+
+  const localServerSuffix = `:${c.env.SERVER_NAME}`.toLowerCase();
+  const normalizedTerm = searchTerm.toLowerCase();
+  const localpartTerm = normalizedTerm.startsWith('@')
+    ? normalizedTerm.slice(1).split(':')[0]
+    : normalizedTerm.split(':')[0];
+
+  // Exact Matrix ID / short localpart lookup first. Element X uses this to
+  // decide whether "Send invite" is safe, so it must not depend on FTS.
+  const exactResults = await db.prepare(`
+    SELECT user_id, display_name, avatar_url
+    FROM users
+    WHERE is_deactivated = 0
+      AND is_guest = 0
+      AND user_id != ?
+      AND (
+        LOWER(user_id) = ?
+        OR LOWER(localpart) = ?
+        OR LOWER(user_id) = ?
+      )
+    LIMIT ?
+  `).bind(
+    requestingUserId,
+    normalizedTerm,
+    localpartTerm,
+    normalizedTerm.includes(':') ? normalizedTerm : `@${localpartTerm}${localServerSuffix}`,
+    limit + 1,
+  ).all<DirectoryUser>();
+  addUsers(exactResults.results);
+
+  // FTS is optional: older databases may not have users_fts, and Matrix IDs
+  // contain punctuation that can produce poor MATCH queries. Fall back below.
+  const ftsSearchTerm = searchTerm
+    .replace(/[@:.'"*()]/g, ' ')
+    .replace(/[^A-Za-z0-9_]+/g, ' ')
+    .trim();
+  if (ftsSearchTerm && usersById.size === 0) {
+    try {
+      const results = await db.prepare(`
+        SELECT u.user_id, u.display_name, u.avatar_url
+        FROM users_fts fts
+        JOIN users u ON fts.user_id = u.user_id
+        WHERE users_fts MATCH ?
+          AND u.is_deactivated = 0
+          AND u.is_guest = 0
+          AND u.user_id != ?
+        ORDER BY bm25(users_fts)
+        LIMIT ?
+      `).bind(ftsSearchTerm, requestingUserId, limit + 1).all<DirectoryUser>();
+      addUsers(results.results);
+    } catch (error) {
+      console.warn('[user_directory] FTS unavailable, using SQL fallback:', error);
+    }
+  }
+
+  if (usersById.size <= limit) {
+    const likeTerm = `%${normalizedTerm.replace(/^@/, '')}%`;
+    const fallbackResults = await db.prepare(`
+      SELECT user_id, display_name, avatar_url
+      FROM users
+      WHERE is_deactivated = 0
+        AND is_guest = 0
+        AND user_id != ?
+        AND (
+          LOWER(user_id) LIKE ?
+          OR LOWER(localpart) LIKE ?
+          OR LOWER(COALESCE(display_name, '')) LIKE ?
+        )
+      ORDER BY
+        CASE
+          WHEN LOWER(localpart) = ? THEN 0
+          WHEN LOWER(user_id) = ? THEN 1
+          WHEN LOWER(localpart) LIKE ? THEN 2
+          ELSE 3
+        END,
+        user_id
+      LIMIT ?
+    `).bind(
+      requestingUserId,
+      likeTerm,
+      likeTerm,
+      likeTerm,
+      localpartTerm,
+      normalizedTerm,
+      `${localpartTerm}%`,
+      limit + 1,
+    ).all<DirectoryUser>();
+    addUsers(fallbackResults.results);
+  }
+
+  const allUsers = [...usersById.values()];
+  const limited = allUsers.length > limit;
   // Return explicit null values (not undefined/omitted) so Element X knows user exists
-  const users = results.results.slice(0, limit).map(u => ({
+  const users = allUsers.slice(0, limit).map(u => ({
     user_id: u.user_id,
     display_name: u.display_name || null,
     avatar_url: u.avatar_url || null,

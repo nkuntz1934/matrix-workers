@@ -534,7 +534,11 @@ app.get('/_matrix/client/v3/keys/changes', requireAuth(), async (c) => {
         SELECT DISTINCT rm2.user_id
         FROM room_memberships rm1
         JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-        WHERE rm1.user_id = ? AND rm1.membership = 'join' AND rm2.membership = 'join'
+        WHERE rm1.user_id = ? AND rm1.membership IN ('join', 'invite')
+          AND (
+            rm2.membership = 'join'
+            OR (rm1.membership = 'join' AND rm2.membership = 'invite')
+          )
       )
   `).bind(fromPosition, toPosition, userId).all<{
     user_id: string;

@@ -32,6 +32,8 @@ interface SlidingSyncConnectionState {
   roomNotificationCounts?: Record<string, number>;
   roomFullyReadMarkers?: Record<string, string>;
   initialSyncComplete?: boolean;
+  lastDeviceKeyChangePos?: number;
+  deviceKeyPosBySyncPos?: Record<string, number>;
   roomSentAsRead?: Record<string, boolean>;
 }
 
@@ -233,8 +235,19 @@ export class SyncDurableObject extends DurableObject<Env> {
   // Wait for events (used by long-polling sliding sync)
   private async handleWaitForEvents(request: Request): Promise<Response> {
     try {
-      const body = await request.json() as { timeout?: number };
-      const timeout = Math.min(body.timeout || 25000, 25000); // Cap at 25s
+      const body = await request.json() as { timeout?: number; afterTimestamp?: number };
+      const requestedTimeout = Number.isFinite(body.timeout) ? body.timeout! : 25000;
+      const timeout = Math.min(Math.max(requestedTimeout, 0), 25000); // Cap at 25s
+      const afterTimestamp = Number.isFinite(body.afterTimestamp) ? body.afterTimestamp : undefined;
+
+      this.pendingEvents = this.pendingEvents.filter(event => event.timestamp >= Date.now() - 60000);
+
+      if (afterTimestamp !== undefined && this.pendingEvents.some(event => event.timestamp >= afterTimestamp)) {
+        console.log('[SyncDO] /wait-for-events found pending event after timestamp:', afterTimestamp);
+        return new Response(JSON.stringify({ hasEvents: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
 
       console.log('[SyncDO] /wait-for-events started, timeout:', timeout, 'current waiters:', this.waitingResolvers.length);
 

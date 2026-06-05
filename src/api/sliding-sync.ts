@@ -2,7 +2,7 @@
 // Implements both the original sliding sync and simplified sliding sync
 
 import { Hono, type Context } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { getTypingForRooms } from './typing';
@@ -196,8 +196,206 @@ interface ConnectionState {
   roomFullyReadMarkers?: Record<string, string>;
   // Track if initial sync has been completed to prevent ephemeral spam on reconnects
   initialSyncComplete?: boolean;
+  // Last device_key_changes stream position delivered via e2ee extension
+  lastDeviceKeyChangePos?: number;
+  // Map issued sliding-sync event pos tokens to the device_key_changes cursor used
+  // for that response. Sliding sync pos is not the same stream as device keys.
+  deviceKeyPosBySyncPos?: Record<string, number>;
   // Track rooms we've sent as "read" (notification_count = 0) to avoid resending
   roomSentAsRead?: Record<string, boolean>;
+}
+
+function getRoomSyncCursor(
+  roomState: ConnectionState['roomStates'][string] | undefined,
+  sincePos: number,
+  isInitialSync: boolean,
+): { isInitialRoom: boolean; roomSincePos: number } {
+  const isInitialRoom = isInitialSync || !roomState?.sentState;
+  if (isInitialRoom) {
+    return { isInitialRoom, roomSincePos: 0 };
+  }
+
+  // Sliding sync clients can have concurrent requests for the same conn_id.
+  // If one response advances stored room state before an older client pos is
+  // retried, using only stored state skips events. Never start after client pos.
+  const storedRoomPos = roomState.lastStreamOrdering || sincePos;
+  return { isInitialRoom, roomSincePos: Math.min(storedRoomPos, sincePos) };
+}
+
+function getDeviceKeySyncCursor(
+  connectionState: ConnectionState,
+  sincePos: number,
+  isInitialSync: boolean,
+): number {
+  if (isInitialSync) {
+    return 0;
+  }
+
+  const tokenCursor = connectionState.deviceKeyPosBySyncPos?.[String(sincePos)];
+  if (typeof tokenCursor === 'number' && Number.isFinite(tokenCursor)) {
+    return tokenCursor;
+  }
+
+  // If this request is behind the saved connection event pos, it is likely an
+  // overlapping or retried sliding-sync request. Without a pos->device cursor
+  // mapping, replay device-key changes conservatively instead of skipping them.
+  const savedEventPos = connectionState.pos ?? sincePos;
+  if (sincePos < savedEventPos) {
+    return 0;
+  }
+
+  return connectionState.lastDeviceKeyChangePos ?? 0;
+}
+
+function rememberDeviceKeySyncCursor(
+  connectionState: ConnectionState,
+  requestPos: number,
+  responsePos: number,
+  deviceKeyPos: number,
+): void {
+  if (responsePos <= requestPos) {
+    return;
+  }
+
+  connectionState.lastDeviceKeyChangePos = Math.max(
+    connectionState.lastDeviceKeyChangePos ?? 0,
+    deviceKeyPos,
+  );
+
+  const cursors = {
+    ...(connectionState.deviceKeyPosBySyncPos ?? {}),
+    [String(responsePos)]: deviceKeyPos,
+  };
+
+  // Keep this bounded; clients only resume from recent pos tokens.
+  const entries = Object.entries(cursors)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .slice(-32);
+  connectionState.deviceKeyPosBySyncPos = Object.fromEntries(entries);
+}
+
+async function getMaxDeviceKeyChangePosition(db: D1Database): Promise<number> {
+  const result = await db.prepare(
+    `SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM device_key_changes`
+  ).first<{ max_pos: number }>();
+  return result?.max_pos ?? 0;
+}
+
+async function userHasDeviceKeys(env: Env, targetUserId: string): Promise<boolean> {
+  try {
+    const userKeysDO = env.USER_KEYS.get(env.USER_KEYS.idFromName(targetUserId));
+    const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
+    if (!deviceIdsResp.ok) {
+      return false;
+    }
+    const deviceIds = await deviceIdsResp.json() as string[];
+    if (deviceIds.length > 0) {
+      return true;
+    }
+
+    const crossSigningResp = await userKeysDO.fetch(new Request('http://internal/cross-signing/get'));
+    if (!crossSigningResp.ok) {
+      return false;
+    }
+    const crossSigningKeys = await crossSigningResp.json() as Record<string, unknown>;
+    return Object.keys(crossSigningKeys).length > 0;
+  } catch (error) {
+    console.error('[sliding-sync] userHasDeviceKeys failed for', targetUserId, error);
+    return false;
+  }
+}
+
+async function getSharedRoomMemberIds(db: D1Database, userId: string): Promise<string[]> {
+  const members = await db.prepare(`
+    SELECT DISTINCT rm2.user_id
+    FROM room_memberships rm1
+    JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+    WHERE rm1.user_id = ? AND rm1.membership IN ('join', 'invite')
+      AND (
+        rm2.membership = 'join'
+        OR (rm1.membership = 'join' AND rm2.membership = 'invite')
+      )
+  `).bind(userId).all<{ user_id: string }>();
+  return members.results.map(row => row.user_id);
+}
+
+async function getUsersWithKeyChangesInSharedRooms(
+  db: D1Database,
+  userId: string,
+  sincePos: number,
+): Promise<{ changed: string[]; left: string[] }> {
+  const changes = await db.prepare(`
+    SELECT DISTINCT dkc.user_id, dkc.change_type
+    FROM device_key_changes dkc
+    WHERE dkc.stream_position > ?
+      AND (
+        dkc.user_id = ?
+        OR EXISTS (
+          SELECT 1 FROM room_memberships rm1
+          JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+          WHERE rm1.user_id = ? AND rm1.membership IN ('join', 'invite')
+            AND rm2.user_id = dkc.user_id
+            AND (
+              rm2.membership = 'join'
+              OR (rm1.membership = 'join' AND rm2.membership = 'invite')
+            )
+        )
+      )
+  `).bind(sincePos, userId, userId).all<{ user_id: string; change_type: string }>();
+
+  const changed: string[] = [];
+  const left: string[] = [];
+  for (const change of changes.results) {
+    if (change.change_type === 'delete') {
+      if (!left.includes(change.user_id)) {
+        left.push(change.user_id);
+      }
+    } else if (!changed.includes(change.user_id)) {
+      changed.push(change.user_id);
+    }
+  }
+  return { changed, left };
+}
+
+async function buildE2EEDeviceListChanges(
+  env: Env,
+  db: D1Database,
+  userId: string,
+  lastDeviceKeyChangePos: number,
+): Promise<{ changed: string[]; left: string[]; newLastPos: number }> {
+  const newLastPos = await getMaxDeviceKeyChangePosition(db);
+  const changed: string[] = [];
+  const left: string[] = [];
+
+  // Use device_key_changes stream (not event pos). On first connect, sincePos=0
+  // returns everyone in shared rooms who has ever uploaded keys — one SQL query,
+  // not N Durable Object round-trips (which caused sync timeouts / "server unavailable").
+  const { changed: fromChanges, left: fromLeft } = await getUsersWithKeyChangesInSharedRooms(
+    db,
+    userId,
+    lastDeviceKeyChangePos,
+  );
+  changed.push(...fromChanges);
+  left.push(...fromLeft);
+
+  if (lastDeviceKeyChangePos === 0) {
+    // Ensure self appears if keys exist but no change row yet (edge case)
+    if (!changed.includes(userId) && await userHasDeviceKeys(env, userId)) {
+      changed.push(userId);
+    }
+    // Room members with keys but no device_key_changes row yet (rare)
+    const members = await getSharedRoomMemberIds(db, userId);
+    const missing = members.filter(m => m !== userId && !changed.includes(m));
+    if (missing.length > 0 && missing.length <= 10) {
+      for (const memberId of missing) {
+        if (await userHasDeviceKeys(env, memberId)) {
+          changed.push(memberId);
+        }
+      }
+    }
+  }
+
+  return { changed, left, newLastPos };
 }
 
 // Helper to get the current maximum stream ordering from the database
@@ -764,8 +962,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
   const queryPos = c.req.query('pos');
   const posToken = queryPos || body.pos;
   const sincePos = posToken ? parseInt(posToken) : 0;
-  // Note: isInitialSync is computed but not currently used (for future diagnostics)
-  void (!posToken || !connectionState);
+  const isInitialSync = !posToken || sincePos === 0;
 
   // If client sends a pos but we don't have connection state, check if the pos
   // is a valid stream position (could be from before a deployment or KV expiry)
@@ -862,8 +1059,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       // Get room data for rooms in range
       for (const roomInfo of roomsInRange) {
         const roomState = connectionState.roomStates[roomInfo.roomId];
-        const isInitialRoom = !roomState?.sentState;
-        const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || 0);
+        const { isInitialRoom, roomSincePos } = getRoomSyncCursor(roomState, sincePos, isInitialSync);
 
         // Handle invited rooms differently - they get invite_state not timeline
         // Always include invited room data (small payload) so client doesn't lose invites on reconnect
@@ -959,8 +1155,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       }
 
       const roomState = connectionState.roomStates[roomId];
-      const isInitialRoom = !roomState?.sentState;
-      const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || 0);
+      const { isInitialRoom, roomSincePos } = getRoomSyncCursor(roomState, sincePos, isInitialSync);
 
       // Handle invited rooms differently - they get invite_state not timeline
       // Always include invited room data (small payload) so client doesn't lose invites on reconnect
@@ -1098,49 +1293,16 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
-      const deviceListChanged: string[] = [];
-
-      if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
-        const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
-        const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
-        const deviceIds = await deviceIdsResp.json() as string[];
-
-        // Also check for cross-signing keys
-        const crossSigningResp = await userKeysDO.fetch(new Request('http://internal/cross-signing/get'));
-        const crossSigningKeys = await crossSigningResp.json() as Record<string, any>;
-
-        if (deviceIds.length > 0 || Object.keys(crossSigningKeys).length > 0) {
-          deviceListChanged.push(userId);
-        }
-      } else {
-        const changes = await db.prepare(`
-          SELECT DISTINCT dkc.user_id
-          FROM device_key_changes dkc
-          WHERE dkc.stream_position > ?
-            AND (
-              dkc.user_id = ?
-              OR EXISTS (
-                SELECT 1 FROM room_memberships rm1
-                JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-                WHERE rm1.user_id = ? AND rm1.membership = 'join'
-                  AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
-              )
-            )
-        `).bind(sincePos, userId, userId).all();
-        deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
-      }
+      // Get device list changes (use device_key_changes stream, NOT event stream pos)
+      const lastDeviceKeyChangePos = getDeviceKeySyncCursor(connectionState, sincePos, isInitialSync);
+      const { changed: deviceListChanged, left: deviceListLeft, newLastPos } =
+        await buildE2EEDeviceListChanges(c.env, db, userId, lastDeviceKeyChangePos);
+      rememberDeviceKeySyncCursor(connectionState, sincePos, currentStreamPos, newLastPos);
 
       response.extensions.e2ee = {
         device_lists: {
           changed: deviceListChanged,
-          left: [],
+          left: deviceListLeft,
         },
         device_one_time_keys_count: keyCounts,
         device_unused_fallback_key_types: unusedFallbackTypes,
@@ -1354,6 +1516,7 @@ function detectNSERequest(
 
 // MSC4186 Simplified Sliding Sync handler (shared between endpoints)
 async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
+  const requestStartedAt = Date.now();
   const userId = c.get('userId');
   const db = c.env.DB;
   const syncDO = c.env.SYNC;  // Use Durable Object for connection state (not KV - avoids rate limits)
@@ -1530,8 +1693,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
 
       for (const roomInfo of roomsInRange) {
         const roomState = connectionState.roomStates[roomInfo.roomId];
-        const isInitialRoom = !roomState?.sentState;
-        const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || sincePos);
+        const { isInitialRoom, roomSincePos } = getRoomSyncCursor(roomState, sincePos, isInitialSync);
 
         // Handle invited rooms differently - they get invite_state not timeline
         // Always include invited room data (small payload) so client doesn't lose invites on reconnect
@@ -1629,8 +1791,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       if (!membershipResult) continue;
 
       const roomState = connectionState.roomStates[roomId];
-      const isInitialRoom = !roomState?.sentState;
-      const roomSincePos = isInitialRoom ? 0 : (roomState?.lastStreamOrdering || sincePos);
+      const { isInitialRoom, roomSincePos } = getRoomSyncCursor(roomState, sincePos, isInitialSync);
 
       // Handle invited rooms differently - they get invite_state not timeline
       // Always include invited room data (small payload) so client doesn't lose invites on reconnect
@@ -1745,6 +1906,9 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         next_batch: nextBatch,
         events,
       };
+      if (events.length > 0) {
+        hasChanges = true;
+      }
     }
 
     // e2ee: enabled if key exists (MSC4186) or enabled=true (MSC3575)
@@ -1776,50 +1940,20 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
-      const deviceListChanged: string[] = [];
-
-      if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
-        const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
-        const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
-        const deviceIds = await deviceIdsResp.json() as string[];
-
-        // Also check for cross-signing keys
-        const crossSigningResp = await userKeysDO.fetch(new Request('http://internal/cross-signing/get'));
-        const crossSigningKeys = await crossSigningResp.json() as Record<string, any>;
-
-        if (deviceIds.length > 0 || Object.keys(crossSigningKeys).length > 0) {
-          deviceListChanged.push(userId);
-        }
-      } else {
-        const changes = await db.prepare(`
-          SELECT DISTINCT dkc.user_id
-          FROM device_key_changes dkc
-          WHERE dkc.stream_position > ?
-            AND (
-              dkc.user_id = ?
-              OR EXISTS (
-                SELECT 1 FROM room_memberships rm1
-                JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-                WHERE rm1.user_id = ? AND rm1.membership = 'join'
-                  AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
-              )
-            )
-        `).bind(sincePos, userId, userId).all();
-        deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
-      }
+      // Get device list changes (use device_key_changes stream, NOT event stream pos)
+      const lastDeviceKeyChangePos = getDeviceKeySyncCursor(connectionState, sincePos, isInitialSync);
+      const { changed: deviceListChanged, left: deviceListLeft, newLastPos } =
+        await buildE2EEDeviceListChanges(c.env, db, userId, lastDeviceKeyChangePos);
+      rememberDeviceKeySyncCursor(connectionState, sincePos, currentStreamPos, newLastPos);
 
       response.extensions.e2ee = {
-        device_lists: { changed: deviceListChanged, left: [] },
+        device_lists: { changed: deviceListChanged, left: deviceListLeft },
         device_one_time_keys_count: keyCounts,
         device_unused_fallback_key_types: unusedFallbackTypes,
       };
+      if (deviceListChanged.length > 0 || deviceListLeft.length > 0) {
+        hasChanges = true;
+      }
     }
 
     // account_data: enabled if key exists (MSC4186) or enabled=true (MSC3575)
@@ -2075,7 +2209,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timeout }),
+        body: JSON.stringify({ timeout, afterTimestamp: requestStartedAt }),
       }));
       const waitResult = await waitResponse.json() as { hasEvents: boolean };
 

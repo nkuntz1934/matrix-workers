@@ -259,7 +259,7 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
         }
 
         // Queue notification for history
-        await this.queueNotification(userId, eventContext, pushResult);
+        await this.queueNotification(userId, eventContext, pushResult, anySuccess);
 
         return { userId, notified: anySuccess, skipped: false };
       } catch (error) {
@@ -315,9 +315,13 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
       SELECT COUNT(*) as count FROM events e
       WHERE e.room_id = ?
         AND e.stream_ordering > COALESCE(
-          (SELECT CAST(json_extract(content, '$.event_id') AS TEXT) FROM account_data
-           WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'),
-          ''
+          (
+            SELECT fe.stream_ordering
+            FROM account_data ad
+            JOIN events fe ON fe.event_id = json_extract(ad.content, '$.event_id')
+            WHERE ad.user_id = ? AND ad.room_id = ? AND ad.event_type = 'm.fully_read'
+          ),
+          0
         )
         AND e.sender != ?
         AND e.event_type IN ('m.room.message', 'm.room.encrypted')
@@ -329,7 +333,7 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
   // Get user's pushers
   private async getUserPushers(userId: string): Promise<SerializablePusher[]> {
     const result = await this.env.DB.prepare(`
-      SELECT pushkey, kind, app_id, data FROM pushers WHERE user_id = ?
+      SELECT pushkey, kind, app_id, data FROM pushers WHERE user_id = ? AND enabled = 1
     `).bind(userId).all<{ pushkey: string; kind: string; app_id: string; data: string }>();
 
     return result.results.map(p => ({
@@ -429,13 +433,44 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
       });
 
       if (response.ok) {
+        let gatewayResponse: any = {};
+        try {
+          gatewayResponse = await response.json();
+        } catch {
+          gatewayResponse = {};
+        }
+
+        const rejected = Array.isArray(gatewayResponse.rejected) ? gatewayResponse.rejected : [];
+        if (rejected.includes(pusher.pushkey)) {
+          console.warn('[PushNotificationWorkflow] Gateway rejected pusher', {
+            userId,
+            appId: pusher.appId,
+          });
+          await this.env.DB.prepare(`
+            UPDATE pushers SET last_failure = ?, failure_count = failure_count + 1
+            WHERE user_id = ? AND pushkey = ? AND app_id = ?
+          `).bind(Date.now(), userId, pusher.pushkey, pusher.appId).run();
+          return false;
+        }
+
         // Update pusher success
         await this.env.DB.prepare(`
           UPDATE pushers SET last_success = ?, failure_count = 0
           WHERE user_id = ? AND pushkey = ? AND app_id = ?
         `).bind(Date.now(), userId, pusher.pushkey, pusher.appId).run();
+        console.log('[PushNotificationWorkflow] Gateway accepted push', {
+          userId,
+          appId: pusher.appId,
+        });
         return true;
       } else {
+        const errorText = await response.text().catch(() => '');
+        console.error('[PushNotificationWorkflow] Gateway failed', {
+          userId,
+          appId: pusher.appId,
+          status: response.status,
+          error: errorText,
+        });
         // Update pusher failure
         await this.env.DB.prepare(`
           UPDATE pushers SET last_failure = ?, failure_count = failure_count + 1
@@ -457,17 +492,19 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
   private async queueNotification(
     userId: string,
     eventContext: { eventId: string; roomId: string },
-    pushResult: PushRuleResult
+    pushResult: PushRuleResult,
+    pushed: boolean,
   ): Promise<void> {
     await this.env.DB.prepare(`
-      INSERT INTO notification_queue (user_id, room_id, event_id, notification_type, actions)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO notification_queue (user_id, room_id, event_id, notification_type, actions, pushed)
+      VALUES (?, ?, ?, ?, ?, ?)
     `).bind(
       userId,
       eventContext.roomId,
       eventContext.eventId,
       pushResult.highlight ? 'highlight' : 'notify',
-      JSON.stringify(pushResult.actions)
+      JSON.stringify(pushResult.actions),
+      pushed ? 1 : 0,
     ).run();
   }
 }

@@ -349,8 +349,11 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     await createRoomAlias(c.env.DB, alias, roomId, userId);
   }
 
-  // Notify the creator's sync that the room was created
-  await notifyUsersOfEvent(c.env, roomId, roomId, 'm.room.create');
+  // Notify the creator and invitees that the room/invite state changed.
+  const inviteesToNotify = Array.isArray(invite)
+    ? invite.filter((invitee: unknown): invitee is string => typeof invitee === 'string')
+    : [];
+  await notifyUsersOfEvent(c.env, roomId, roomId, 'm.room.create', inviteesToNotify);
 
   return c.json({
     room_id: roomId,
@@ -542,8 +545,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, userId, 'leave', eventId);
 
-  // Notify room members about the leave
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Notify room members and the leaving user's sync.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member', [userId]);
 
   return c.json({});
 });
@@ -1106,8 +1109,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, inviteeId, 'invite', eventId);
 
-  // Notify room members and the invitee about the invite
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Notify room members and the invitee about the invite.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member', [inviteeId]);
 
   return c.json({});
 });
@@ -1187,8 +1190,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
-  // Notify room members about the kick
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Notify room members and the kicked user.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member', [targetId]);
 
   return c.json({});
 });
@@ -1263,8 +1266,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, targetId, 'ban', eventId);
 
-  // Notify room members about the ban
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Notify room members and the banned user.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member', [targetId]);
 
   return c.json({});
 });
@@ -1343,8 +1346,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
   await storeEvent(c.env.DB, event);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
-  // Notify room members about the unban
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+  // Notify room members and the unbanned user.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member', [targetId]);
 
   return c.json({});
 });
@@ -1678,6 +1681,9 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
 
   await storeEvent(db, event);
   await updateMembership(db, roomId, userId, 'join', eventId);
+
+  // Keep /join/:roomIdOrAlias behavior aligned with /rooms/:roomId/join.
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
 
   return c.json({ room_id: roomId });
 });

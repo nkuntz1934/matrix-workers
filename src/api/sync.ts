@@ -250,6 +250,7 @@ function buildSyncToken(eventsPos: number, toDevicePos: number): string {
 }
 
 app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
+  const requestStartedAt = Date.now();
   const userId = c.get('userId');
   const deviceId = c.get('deviceId');
 
@@ -564,7 +565,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeout: waitTimeout }),
+      body: JSON.stringify({ timeout: waitTimeout, afterTimestamp: requestStartedAt }),
     }));
 
     const waitResult = await waitResponse.json() as { hasEvents: boolean };
