@@ -8,6 +8,8 @@ import { requireAuth } from '../middleware/auth';
 import { hashToken, verifyPassword } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
 import { createDevice, createAccessToken, getUserById } from '../services/database';
+import { signIdToken } from '../services/oidc-id-token';
+import { getOrCreateOidcSigningKey } from '../services/oidc-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -461,12 +463,32 @@ app.post('/oauth/token', async (c) => {
       expirationTtl: 30 * 24 * 60 * 60, // 30 days
     });
 
+    // OIDC: issue a signed id_token when the openid scope was granted. Element
+    // Web/Desktop (oidc-client-ts) require and verify this against the JWKS;
+    // without it they fail auth after a successful token exchange. Element X
+    // (pure OAuth2) ignores it.
+    let idToken: string | undefined;
+    if (scopes.includes('openid')) {
+      const signingKey = await getOrCreateOidcSigningKey(c.env.CACHE);
+      idToken = await signIdToken({
+        issuer: `https://${c.env.SERVER_NAME}`,
+        subject: authCode.user_id,
+        audience: effectiveClientId,
+        nonce: authCode.nonce,
+        nowSec: Math.floor(Date.now() / 1000),
+        expiresInSec: 86400,
+        privateKeyJwk: signingKey.privateKeyJwk,
+        kid: signingKey.kid,
+      });
+    }
+
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: 86400, // 24 hours
       refresh_token: newRefreshToken,
       scope: authCode.scope,
+      ...(idToken ? { id_token: idToken } : {}),
       // Matrix-specific fields
       user_id: authCode.user_id,
       device_id: deviceId,
@@ -518,12 +540,28 @@ app.post('/oauth/token', async (c) => {
       expirationTtl: 30 * 24 * 60 * 60,
     });
 
+    // Re-issue an id_token on refresh too (no nonce on refresh, per OIDC).
+    let refreshIdToken: string | undefined;
+    if ((tokenData.scope?.split(' ') || []).includes('openid')) {
+      const signingKey = await getOrCreateOidcSigningKey(c.env.CACHE);
+      refreshIdToken = await signIdToken({
+        issuer: `https://${c.env.SERVER_NAME}`,
+        subject: tokenData.user_id,
+        audience: effectiveClientId,
+        nowSec: Math.floor(Date.now() / 1000),
+        expiresInSec: 86400,
+        privateKeyJwk: signingKey.privateKeyJwk,
+        kid: signingKey.kid,
+      });
+    }
+
     return c.json({
       access_token: newAccessToken,
       token_type: 'Bearer',
       expires_in: 86400,
       refresh_token: newRefreshToken,
       scope: tokenData.scope,
+      ...(refreshIdToken ? { id_token: refreshIdToken } : {}),
     });
 
   } else {

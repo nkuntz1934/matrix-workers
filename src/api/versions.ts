@@ -2,6 +2,7 @@
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
+import { getOrCreateOidcSigningKey } from '../services/oidc-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -72,7 +73,7 @@ app.get('/.well-known/openid-configuration', (c) => {
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256', 'plain'],
     subject_types_supported: ['public'],
-    id_token_signing_alg_values_supported: ['RS256', 'ES256'],
+    id_token_signing_alg_values_supported: ['RS256'],
     claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'name', 'email'],
     // Matrix-specific extension
     'org.matrix.matrix-authentication-service': {
@@ -85,12 +86,12 @@ app.get('/.well-known/openid-configuration', (c) => {
 });
 
 // GET /.well-known/jwks.json - JSON Web Key Set for token verification
-app.get('/.well-known/jwks.json', (c) => {
-  // Return an empty JWKS - clients can't verify our tokens without keys
-  // In a real implementation, you'd generate and store RSA keys
-  // For now, returning a placeholder that indicates we use opaque tokens
+app.get('/.well-known/jwks.json', async (c) => {
+  // Publish the OIDC id_token signing key so clients (e.g. Element Web/Desktop)
+  // can verify id_tokens issued by /oauth/token.
+  const signingKey = await getOrCreateOidcSigningKey(c.env.CACHE);
   return c.json({
-    keys: [],
+    keys: [signingKey.publicKeyJwk],
   });
 });
 

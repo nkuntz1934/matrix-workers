@@ -457,10 +457,13 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
     token_endpoint: `${baseUrl}/oauth/token`,
     revocation_endpoint: `${baseUrl}/oauth/revoke`,
     registration_endpoint: `${baseUrl}/oauth/register`,
+    // JWKS for verifying id_tokens — required by oidc-client-ts (Element Web/Desktop)
+    jwks_uri: `${baseUrl}/.well-known/jwks.json`,
     // Required capabilities
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256', 'plain'],
+    id_token_signing_alg_values_supported: ['RS256'],
     // Additional optional fields that Element Web may check
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     scopes_supported: [
