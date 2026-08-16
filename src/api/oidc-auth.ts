@@ -85,15 +85,23 @@ async function getEncryptionKey(
 }
 
 // Encrypt a secret using AES-GCM
-// Uses OIDC_ENCRYPTION_KEY if available, otherwise falls back to SERVER_NAME (legacy)
+// Encrypt a secret using AES-GCM with the secure OIDC_ENCRYPTION_KEY.
+// Refuses to encrypt with the legacy SERVER_NAME-based key — new secrets
+// must use a proper encryption key.
 async function encryptSecret(
   secret: string,
   env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string }
 ): Promise<string> {
   const encoder = new TextEncoder();
 
-  // Determine which version to use
-  const version = env.OIDC_ENCRYPTION_KEY ? ENCRYPTION_VERSION_SECURE : ENCRYPTION_VERSION_LEGACY;
+  if (!env.OIDC_ENCRYPTION_KEY) {
+    throw new Error(
+      'OIDC_ENCRYPTION_KEY is required for OIDC client registration. ' +
+      'Generate with: openssl rand -base64 32 | npx wrangler secret put OIDC_ENCRYPTION_KEY'
+    );
+  }
+
+  const version = ENCRYPTION_VERSION_SECURE;
   const keyMaterial = await getEncryptionKey(env, version);
 
   const iv = crypto.getRandomValues(new Uint8Array(12));

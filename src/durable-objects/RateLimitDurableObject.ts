@@ -46,7 +46,7 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
 
       switch (body.action) {
         case 'check':
-          return Response.json(this.checkLimit(body.clientId, body.limit, body.windowMs));
+          return Response.json(await this.checkLimit(body.clientId, body.limit, body.windowMs));
         case 'reset':
           this.counters.delete(body.clientId);
           return Response.json({ success: true });
@@ -62,12 +62,12 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
     }
   }
 
-  private checkLimit(clientId: string, limit: number, windowMs: number): CheckLimitResponse {
+  private async checkLimit(clientId: string, limit: number, windowMs: number): Promise<CheckLimitResponse> {
     const now = Date.now();
     const entry = this.counters.get(clientId);
 
     // Schedule cleanup if not already scheduled
-    this.scheduleCleanup();
+    await this.scheduleCleanup();
 
     // Check if entry exists and is within the window
     if (entry && entry.windowStart > now - windowMs) {
@@ -113,19 +113,28 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
     }
   }
 
-  private scheduleCleanup() {
-    // Schedule cleanup every 5 minutes
+  private async scheduleCleanup() {
     const now = Date.now();
     const fiveMinutes = 5 * 60 * 1000;
 
     if (!this.cleanupAlarm || this.cleanupAlarm < now) {
       this.cleanupAlarm = now + fiveMinutes;
-      // Use a setTimeout instead of alarm for simplicity
-      // The cleanup will happen naturally when new requests come in
+      // Schedule a real DO alarm so cleanup runs even without incoming requests
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      if (!currentAlarm) {
+        await this.ctx.storage.setAlarm(now + fiveMinutes);
+      }
     }
   }
 
   async alarm() {
     this.cleanupExpiredEntries();
+    // Reschedule if there are still entries to track
+    if (this.counters.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 5 * 60 * 1000);
+      this.cleanupAlarm = Date.now() + 5 * 60 * 1000;
+    } else {
+      this.cleanupAlarm = null;
+    }
   }
 }

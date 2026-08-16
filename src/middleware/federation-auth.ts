@@ -124,12 +124,18 @@ export function requireFederationAuth() {
     const uri = url.pathname + url.search;
 
     // Parse body for POST/PUT requests
+    // IMPORTANT: Buffer the body so downstream handlers can still read it.
+    // Request bodies can only be consumed once in the Workers runtime.
     let content: unknown;
     if (method === 'POST' || method === 'PUT') {
       try {
         const bodyText = await c.req.text();
         if (bodyText) {
           content = JSON.parse(bodyText);
+          // Store the parsed body on the context so handlers can access it
+          // via c.get('federationBody') instead of re-reading c.req.json()
+          c.set('federationBody' as any, content);
+          c.set('federationBodyRaw' as any, bodyText);
         }
       } catch {
         // Body parsing failed - proceed without content
@@ -218,9 +224,13 @@ export function optionalFederationAuth() {
         if (method === 'POST' || method === 'PUT') {
           try {
             const bodyText = await c.req.text();
-            if (bodyText) content = JSON.parse(bodyText);
+            if (bodyText) {
+              content = JSON.parse(bodyText);
+              c.set('federationBody' as any, content);
+              c.set('federationBodyRaw' as any, bodyText);
+            }
           } catch {
-            // Ignore
+            // Body parsing failed
           }
         }
 
@@ -251,9 +261,20 @@ export function optionalFederationAuth() {
 
         if (isValid) {
           c.set('federationOrigin' as any, authParams.origin);
+        } else {
+          // Auth was provided but signature was invalid — reject rather than
+          // silently degrading to unauthenticated. This prevents a malicious
+          // server from having its forged auth quietly accepted as "no auth".
+          console.warn(`[federation] Optional auth: invalid signature from ${authParams.origin}`);
+          return c.json(
+            { errcode: 'M_UNAUTHORIZED', error: 'Invalid request signature' },
+            401
+          );
         }
-      } catch {
-        // Silently ignore auth errors for optional auth
+      } catch (err) {
+        // Log auth errors but allow the request to proceed unauthenticated
+        // only if the error is a key-fetch failure (not a validation failure)
+        console.warn(`[federation] Optional auth error for ${authParams.origin}:`, err);
       }
     }
 

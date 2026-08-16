@@ -15,8 +15,19 @@ interface Participant {
   deviceId: string;
   sessionId: string; // Cloudflare Calls session ID
   tracks: Map<string, TrackInfo>; // trackName -> TrackInfo
-  webSocket: WebSocket | null;
   joinedAt: number;
+}
+
+interface StoredParticipant {
+  oderId: string;
+  deviceId: string;
+  sessionId: string;
+  tracks: Record<string, TrackInfo>;
+  joinedAt: number;
+}
+
+interface CallSocketAttachment {
+  participantKey: string;
 }
 
 interface TrackInfo {
@@ -128,6 +139,7 @@ export class CallRoomDurableObject implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
   private participants: Map<string, Participant> = new Map(); // oderId|deviceId -> Participant
+  private participantsLoaded: boolean = false;
   private callId: string | null = null;
   private matrixRoomId: string | null = null;
 
@@ -181,6 +193,42 @@ export class CallRoomDurableObject implements DurableObject {
       callId: this.callId,
       roomId: this.matrixRoomId,
     });
+  }
+
+  private async loadParticipants(): Promise<void> {
+    if (this.participantsLoaded) return;
+
+    const stored = await this.state.storage.list<StoredParticipant>({ prefix: 'participant:' });
+    this.participants.clear();
+
+    for (const [key, participant] of stored) {
+      const participantKey = key.slice('participant:'.length);
+      this.participants.set(participantKey, {
+        oderId: participant.oderId,
+        deviceId: participant.deviceId,
+        sessionId: participant.sessionId,
+        tracks: new Map(Object.entries(participant.tracks)),
+        joinedAt: participant.joinedAt,
+      });
+    }
+
+    this.participantsLoaded = true;
+  }
+
+  private async persistParticipant(participantKey: string, participant: Participant): Promise<void> {
+    const stored: StoredParticipant = {
+      oderId: participant.oderId,
+      deviceId: participant.deviceId,
+      sessionId: participant.sessionId,
+      tracks: Object.fromEntries(participant.tracks.entries()),
+      joinedAt: participant.joinedAt,
+    };
+
+    await this.state.storage.put(`participant:${participantKey}`, stored);
+  }
+
+  private async deleteParticipant(participantKey: string): Promise<void> {
+    await this.state.storage.delete(`participant:${participantKey}`);
   }
 
   private async handleWebSocket(request: Request): Promise<Response> {
@@ -252,6 +300,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleJoin(ws: WebSocket, msg: JoinMessage): Promise<void> {
+    await this.loadParticipants();
+
     const participantKey = `${msg.userId}|${msg.deviceId}`;
 
     // Check if already joined
@@ -268,13 +318,14 @@ export class CallRoomDurableObject implements DurableObject {
       deviceId: msg.deviceId,
       sessionId: session.sessionId,
       tracks: new Map(),
-      webSocket: ws,
       joinedAt: Date.now(),
     };
 
     this.participants.set(participantKey, participant);
+    await this.persistParticipant(participantKey, participant);
 
     // Tag the WebSocket for later lookup
+    ws.serializeAttachment({ participantKey } satisfies CallSocketAttachment);
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair(
         JSON.stringify({ type: 'ping' }),
@@ -309,6 +360,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleOffer(ws: WebSocket, msg: OfferMessage): Promise<void> {
+    await this.loadParticipants();
+
     const participant = this.getParticipantBySocket(ws);
     if (!participant) {
       this.sendError(ws, 'NOT_JOINED', 'Must join before sending offer');
@@ -346,6 +399,7 @@ export class CallRoomDurableObject implements DurableObject {
       kind: msg.kind,
       enabled: true,
     });
+    await this.persistParticipant(`${participant.oderId}|${participant.deviceId}`, participant);
 
     // Send answer back to client
     const answerMsg: OfferResponseMessage = {
@@ -369,6 +423,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleAnswer(ws: WebSocket, msg: AnswerMessage): Promise<void> {
+    await this.loadParticipants();
+
     const participant = this.getParticipantBySocket(ws);
     if (!participant) {
       this.sendError(ws, 'NOT_JOINED', 'Must join before sending answer');
@@ -385,6 +441,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleLeave(ws: WebSocket): Promise<void> {
+    await this.loadParticipants();
+
     const participant = this.getParticipantBySocket(ws);
     if (!participant) return;
 
@@ -402,6 +460,7 @@ export class CallRoomDurableObject implements DurableObject {
 
     // Remove participant
     this.participants.delete(participantKey);
+    await this.deleteParticipant(participantKey);
 
     // Notify other participants
     const leftMsg: ParticipantLeftMessage = {
@@ -420,6 +479,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleMute(ws: WebSocket, msg: MuteMessage): Promise<void> {
+    await this.loadParticipants();
+
     const participant = this.getParticipantBySocket(ws);
     if (!participant) {
       this.sendError(ws, 'NOT_JOINED', 'Must join before muting');
@@ -433,6 +494,7 @@ export class CallRoomDurableObject implements DurableObject {
     }
 
     track.enabled = !msg.muted;
+    await this.persistParticipant(`${participant.oderId}|${participant.deviceId}`, participant);
 
     // Notify other participants about mute state
     this.broadcast({
@@ -444,7 +506,9 @@ export class CallRoomDurableObject implements DurableObject {
     }, `${participant.oderId}|${participant.deviceId}`);
   }
 
-  private handleGetState(): Response {
+  private async handleGetState(): Promise<Response> {
+    await this.loadParticipants();
+
     return Response.json({
       callId: this.callId,
       roomId: this.matrixRoomId,
@@ -463,6 +527,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private async handleEndCall(): Promise<Response> {
+    await this.loadParticipants();
+
     // Close all participant sessions
     for (const participant of this.participants.values()) {
       if (participant.tracks.size > 0) {
@@ -473,11 +539,13 @@ export class CallRoomDurableObject implements DurableObject {
           // Ignore errors
         }
       }
+    }
 
-      // Close WebSocket
-      if (participant.webSocket) {
+    for (const ws of this.state.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
+      if (attachment?.participantKey) {
         try {
-          participant.webSocket.close(1000, 'Call ended');
+          ws.close(1000, 'Call ended');
         } catch {
           // Already closed
         }
@@ -493,12 +561,8 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private getParticipantBySocket(ws: WebSocket): Participant | null {
-    for (const participant of this.participants.values()) {
-      if (participant.webSocket === ws) {
-        return participant;
-      }
-    }
-    return null;
+    const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
+    return attachment?.participantKey ? this.participants.get(attachment.participantKey) || null : null;
   }
 
   private send(ws: WebSocket, msg: object): void {
@@ -515,9 +579,11 @@ export class CallRoomDurableObject implements DurableObject {
   }
 
   private broadcast(msg: object, excludeKey?: string): void {
-    for (const [key, participant] of this.participants) {
-      if (key !== excludeKey && participant.webSocket) {
-        this.send(participant.webSocket, msg);
+    for (const ws of this.state.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
+      const participantKey = attachment?.participantKey;
+      if (participantKey && participantKey !== excludeKey && this.participants.has(participantKey)) {
+        this.send(ws, msg);
       }
     }
   }

@@ -97,6 +97,22 @@ function isBlockedIPv6(ip: string): boolean {
     return true;
   }
 
+  // Multicast (ff00::/8)
+  if (normalized.startsWith('ff')) {
+    return true;
+  }
+
+  // Deprecated site-local (fec0::/10)
+  if (normalized.startsWith('fec') || normalized.startsWith('fed') ||
+      normalized.startsWith('fee') || normalized.startsWith('fef')) {
+    return true;
+  }
+
+  // Documentation prefix (2001:db8::/32)
+  if (normalized.startsWith('2001:db8') || normalized.startsWith('2001:0db8')) {
+    return true;
+  }
+
   return false;
 }
 

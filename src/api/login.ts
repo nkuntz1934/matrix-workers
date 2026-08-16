@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
-import { hashPassword, verifyPassword, hashToken } from '../utils/crypto';
+import { hashPassword, verifyPassword, hashToken, validatePasswordStrength } from '../utils/crypto';
 import {
   formatUserId,
   generateDeviceId,
@@ -103,6 +103,22 @@ app.post('/_matrix/client/v3/login', async (c) => {
       return Errors.unrecognized('Unknown identifier type').toResponse();
     }
 
+    // Check for account lockout (brute force protection)
+    const lockoutKey = `lockout:${userId}`;
+    const lockoutData = await c.env.SESSIONS.get(lockoutKey, 'json') as {
+      attempts: number;
+      lockedUntil?: number;
+    } | null;
+
+    if (lockoutData?.lockedUntil && Date.now() < lockoutData.lockedUntil) {
+      const retryAfterMs = lockoutData.lockedUntil - Date.now();
+      return c.json({
+        errcode: 'M_LIMIT_EXCEEDED',
+        error: 'Too many failed login attempts. Try again later.',
+        retry_after_ms: retryAfterMs,
+      }, 429);
+    }
+
     // Get stored password hash
     const storedHash = await getPasswordHash(c.env.DB, userId);
     if (!storedHash) {
@@ -112,7 +128,22 @@ app.post('/_matrix/client/v3/login', async (c) => {
     // Verify password
     const valid = await verifyPassword(password, storedHash);
     if (!valid) {
+      // Track failed attempt
+      const attempts = (lockoutData?.attempts || 0) + 1;
+      const lockout: { attempts: number; lockedUntil?: number } = { attempts };
+      // Lock account after 5 failed attempts for 15 minutes
+      if (attempts >= 5) {
+        lockout.lockedUntil = Date.now() + 15 * 60 * 1000;
+        console.warn(`[login] Account ${userId} locked after ${attempts} failed attempts`);
+      }
+      // Store with 1-hour TTL so counters auto-expire
+      await c.env.SESSIONS.put(lockoutKey, JSON.stringify(lockout), { expirationTtl: 3600 });
       return Errors.forbidden('Invalid username or password').toResponse();
+    }
+
+    // Clear failed attempts on successful login
+    if (lockoutData) {
+      await c.env.SESSIONS.delete(lockoutKey);
     }
   } else if (type === 'm.login.dummy') {
     // m.login.dummy is for UIA flows - requires identifier but no password verification
@@ -347,6 +378,12 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
     if (!password) {
       return Errors.missingParam('password').toResponse();
+    }
+
+    // Validate password strength
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) {
+      return c.json({ errcode: 'M_WEAK_PASSWORD', error: passwordError }, 400);
     }
   }
 

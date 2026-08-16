@@ -77,10 +77,37 @@ export function requireAuth() {
       try {
         const appservice = await getAppServiceByToken(c.env.DB, token);
         if (appservice) {
-          // AS can act as its sender user or as a user specified by user_id query param
           const url = new URL(c.req.url);
           const asUserId = url.searchParams.get('user_id');
           const serverName = c.env.SERVER_NAME;
+
+          if (asUserId) {
+            // Validate the user_id format: must be @localpart:servername
+            const userIdMatch = asUserId.match(/^@[a-z0-9._=/+-]+:[a-zA-Z0-9.-]+$/);
+            if (!userIdMatch) {
+              console.warn(`[AUTH] AppService tried to use invalid user_id format: ${asUserId}`);
+              return Errors.forbidden('Invalid user_id format').toResponse();
+            }
+
+            // Validate that the user belongs to the local server
+            const userServer = asUserId.split(':').slice(1).join(':');
+            if (userServer !== serverName) {
+              console.warn(`[AUTH] AppService tried to impersonate user on foreign server: ${asUserId}`);
+              return Errors.forbidden('Cannot impersonate users on other servers').toResponse();
+            }
+
+            // Validate against the AppService's registered user namespace
+            if (appservice.namespaces?.users?.length > 0) {
+              const allowed = appservice.namespaces.users.some((ns) => {
+                try { return new RegExp(ns.regex).test(asUserId); } catch { return false; }
+              });
+              if (!allowed) {
+                console.warn(`[AUTH] AppService tried to act as user outside its namespace: ${asUserId}`);
+                return Errors.forbidden('User not in application service namespace').toResponse();
+              }
+            }
+          }
+
           const senderUserId = asUserId || `@${appservice.sender_localpart}:${serverName}`;
           auth = {
             userId: senderUserId,
@@ -89,7 +116,7 @@ export function requireAuth() {
           };
         }
       } catch (asErr) {
-        // Ignore AS token lookup errors
+        console.warn('[AUTH] AppService token lookup error:', asErr);
       }
     }
 

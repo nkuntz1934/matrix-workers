@@ -489,48 +489,72 @@ async function getRoomData(
     }));
   }
 
-  // Get required state
+  // Get required state — collapse N requested (type, state_key) pairs into a
+  // single query with OR conditions to avoid N+1 round-trips per room.
   if (config.requiredState && config.requiredState.length > 0) {
     result.required_state = [];
 
+    const orClauses: string[] = [];
+    const stateParams: any[] = [roomId];
+    let needsAll = false;
+
     for (const [eventType, stateKey] of config.requiredState) {
-      let stateQuery = `
+      if (eventType === '*' && (stateKey === '*' || stateKey === '')) {
+        needsAll = true;
+        break;
+      }
+      const parts: string[] = [];
+      if (eventType !== '*') {
+        parts.push('rs.event_type = ?');
+        stateParams.push(eventType);
+      }
+      if (stateKey === '') {
+        parts.push("rs.state_key = ''");
+      } else if (stateKey !== '*') {
+        parts.push('rs.state_key = ?');
+        stateParams.push(stateKey === '$ME' ? userId : stateKey);
+      }
+      // If both are wildcards (and we didn't take the needsAll branch above
+      // because eventType wasn't '*'), the row matches on event_type alone.
+      orClauses.push(parts.length > 0 ? `(${parts.join(' AND ')})` : '1=1');
+    }
+
+    let stateQuery: string;
+    let bindParams: any[];
+    if (needsAll) {
+      stateQuery = `
         SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
         FROM room_state rs
         JOIN events e ON rs.event_id = e.event_id
         WHERE rs.room_id = ?
       `;
-      const stateParams: any[] = [roomId];
+      bindParams = [roomId];
+    } else {
+      stateQuery = `
+        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
+        FROM room_state rs
+        JOIN events e ON rs.event_id = e.event_id
+        WHERE rs.room_id = ? AND (${orClauses.join(' OR ')})
+      `;
+      bindParams = stateParams;
+    }
 
-      if (eventType !== '*') {
-        stateQuery += ` AND rs.event_type = ?`;
-        stateParams.push(eventType);
-      }
-
-      if (stateKey !== '*' && stateKey !== '') {
-        stateQuery += ` AND rs.state_key = ?`;
-        // Handle $ME placeholder - replace with actual user ID
-        const resolvedStateKey = stateKey === '$ME' ? userId : stateKey;
-        stateParams.push(resolvedStateKey);
-      } else if (stateKey === '') {
-        stateQuery += ` AND rs.state_key = ''`;
-      }
-
-      const stateEvents = await db.prepare(stateQuery).bind(...stateParams).all();
-
-      for (const event of stateEvents.results as any[]) {
-        try {
-          result.required_state.push({
-            type: event.event_type,
-            state_key: event.state_key,
-            content: JSON.parse(event.content),
-            sender: event.sender,
-            origin_server_ts: event.origin_server_ts,
-            event_id: event.event_id,
-            unsigned: event.unsigned ? JSON.parse(event.unsigned) : undefined,
-          });
-        } catch { /* ignore parse errors */ }
-      }
+    const stateEvents = await db.prepare(stateQuery).bind(...bindParams).all();
+    const seenIds = new Set<string>();
+    for (const event of stateEvents.results as any[]) {
+      if (seenIds.has(event.event_id)) continue;
+      seenIds.add(event.event_id);
+      try {
+        result.required_state.push({
+          type: event.event_type,
+          state_key: event.state_key,
+          content: JSON.parse(event.content),
+          sender: event.sender,
+          origin_server_ts: event.origin_server_ts,
+          event_id: event.event_id,
+          unsigned: event.unsigned ? JSON.parse(event.unsigned) : undefined,
+        });
+      } catch { /* ignore parse errors */ }
     }
   }
 
@@ -946,9 +970,13 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
   }
 
-  // Process room subscriptions
+  // Process room subscriptions (capped to prevent DoS via oversized requests)
   if (body.room_subscriptions) {
-    for (const [roomId, subscription] of Object.entries(body.room_subscriptions)) {
+    const subscriptionEntries = Object.entries(body.room_subscriptions);
+    if (subscriptionEntries.length > 100) {
+      return c.json({ errcode: 'M_TOO_LARGE', error: 'Too many room subscriptions (max 100 per request)' }, 400);
+    }
+    for (const [roomId, subscription] of subscriptionEntries) {
       // Check if user has access to this room
       const membershipResult = await db.prepare(`
         SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
@@ -1619,9 +1647,13 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }
   }
 
-  // Process room subscriptions
+  // Process room subscriptions (capped to prevent DoS)
   if (body.room_subscriptions) {
-    for (const [roomId, subscription] of Object.entries(body.room_subscriptions)) {
+    const msc4186Entries = Object.entries(body.room_subscriptions);
+    if (msc4186Entries.length > 100) {
+      return c.json({ errcode: 'M_TOO_LARGE', error: 'Too many room subscriptions (max 100 per request)' }, 400);
+    }
+    for (const [roomId, subscription] of msc4186Entries) {
       const membershipResult = await db.prepare(`
         SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
       `).bind(roomId, userId).first() as { membership: string } | null;

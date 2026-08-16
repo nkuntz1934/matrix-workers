@@ -7,7 +7,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { hashPassword, verifyPassword } from '../utils/crypto';
+import { hashPassword, verifyPassword, validatePasswordStrength } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, deleteAllUserTokens } from '../services/database';
 import {
@@ -44,6 +44,12 @@ app.post('/_matrix/client/v3/account/password', requireAuth(), async (c) => {
 
   if (!new_password) {
     return Errors.missingParam('new_password').toResponse();
+  }
+
+  // Validate password strength
+  const passwordError = validatePasswordStrength(new_password);
+  if (passwordError) {
+    return c.json({ errcode: 'M_WEAK_PASSWORD', error: passwordError }, 400);
   }
 
   // Require UIA for password change

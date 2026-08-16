@@ -1,0 +1,47 @@
+name: Feature
+description: New capability or spec compliance
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: spec_area
+    attributes:
+      label: Spec Area
+      options: [Auth, Events, Rooms, Sync, Media, Federation, Push, Search, Admin, Core, New]
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: [Critical, High, Medium, Low]
+    validations:
+      required: true
+  - type: dropdown
+    id: effort
+    attributes:
+      label: Effort
+      options: [XS, S, M, L, XL]
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options: [Backlog, Ready, "In Progress", Blocked]
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What should this do?
+    validations:
+      required: true
+  - type: textarea
+    id: spec_ref
+    attributes:
+      label: Matrix spec reference
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria

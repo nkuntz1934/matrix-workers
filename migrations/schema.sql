@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,                    -- @localpart:domain format
     localpart TEXT NOT NULL,
-    password_hash TEXT,                          -- Argon2 hash
+    password_hash TEXT,                          -- PBKDF2-SHA256 hash (100,000 iterations)
     display_name TEXT,
     avatar_url TEXT,
     is_guest INTEGER DEFAULT 0,

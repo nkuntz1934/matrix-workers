@@ -1,8 +1,11 @@
 # Matrix Homeserver on Cloudflare Workers
 
-[![Security](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/nkuntz1934/matrix-workers/actions/workflows/security.yml)
+[![CI](https://github.com/fuzzywigg/matrix-workers/actions/workflows/ci.yml/badge.svg)](https://github.com/fuzzywigg/matrix-workers/actions/workflows/ci.yml)
+[![Security](https://github.com/fuzzywigg/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/fuzzywigg/matrix-workers/actions/workflows/security.yml)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nkuntz1934/matrix-workers)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fuzzywigg/matrix-workers)
+
+> **Fork Status**: This is fuzzywigg's fork of [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers) (Tuwunel), under active development for the smtp.eth ecosystem. Deployed at `matrix.fuzzywigg.com`. See [DEPLOY.md](./DEPLOY.md) for the fork-specific setup guide.
 
 This is a proof of concept Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. This was built to prove E2EE utilizing Matrix protocols over Element X on the Cloudflare Workers Platform. It is meant to serve as an example prototype and not endorsed as ready for production at this point.
 
@@ -29,25 +32,25 @@ The fastest way to deploy is using the Deploy to Cloudflare button at the top of
 
 ```bash
 # Clone and install
-git clone https://github.com/SilentHeroes/matrix-worker
-cd matrix-worker
+git clone https://github.com/fuzzywigg/matrix-workers
+cd matrix-workers
 npm install
 
-# Create resources (save IDs from output)
-npx wrangler d1 create my-matrix-db
+# Create resources (save IDs from output) — or run: bash scripts/setup.sh
+npx wrangler d1 create matrix-db
 npx wrangler kv namespace create SESSIONS
 npx wrangler kv namespace create DEVICE_KEYS
 npx wrangler kv namespace create ONE_TIME_KEYS
 npx wrangler kv namespace create CROSS_SIGNING_KEYS
 npx wrangler kv namespace create CACHE
 npx wrangler kv namespace create ACCOUNT_DATA
-npx wrangler r2 bucket create my-matrix-media
+npx wrangler r2 bucket create matrix-media
 
 # Update wrangler.jsonc with your resource IDs and SERVER_NAME
-# Then run migrations and deploy (see DEPLOYMENT.md for details)
+# Then run migrations and deploy (see DEPLOY.md for details)
 ```
 
-**See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.**
+**See [DEPLOY.md](./DEPLOY.md) for the fork-specific step-by-step guide, or [DEPLOYMENT.md](./DEPLOYMENT.md) for the upstream general guide.**
 
 ### Email Verification (Optional)
 
@@ -71,7 +74,7 @@ npx wrangler secret put EMAIL_FROM
 |--------------|----------------|----------------|
 | [Client-Server API](https://spec.matrix.org/v1.17/client-server-api/) | [`src/api/`](src/api/) | Auth, sync, rooms, messaging, profiles |
 | [Server-Server API](https://spec.matrix.org/v1.17/server-server-api/) | [`src/api/federation.ts`](src/api/federation.ts) | Federation, PDUs, EDUs, key exchange |
-| [Room Versions](https://spec.matrix.org/v1.17/rooms/) | [`src/services/events.ts`](src/services/events.ts) | v1-v12, event auth, state resolution |
+| [Room Versions](https://spec.matrix.org/v1.17/rooms/) | [`src/services/event-auth.ts`](src/services/event-auth.ts), [`room-versions.ts`](src/services/room-versions.ts), [`state-resolution.ts`](src/services/state-resolution.ts) | v1-v12, event auth, state resolution |
 | [End-to-End Encryption](https://spec.matrix.org/v1.17/client-server-api/#end-to-end-encryption) | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/key-backups.ts`](src/api/key-backups.ts) | Device keys, OTKs, cross-signing, key backup |
 | [OAuth 2.0 API](https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api) | [`src/api/oauth.ts`](src/api/oauth.ts), [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | MSC3861, MSC2965, MSC2967, MSC4191 |
 | [Discovery](https://spec.matrix.org/v1.17/client-server-api/#server-discovery) | [`src/index.ts`](src/index.ts) | `.well-known/matrix/client`, `/versions` |
@@ -295,6 +298,16 @@ npm run db:migrate:local
 | `RATE_LIMIT` | Durable Object | Rate limiting |
 | `ROOM_JOIN_WORKFLOW` | Workflow | Async room join processing |
 | `PUSH_NOTIFICATION_WORKFLOW` | Workflow | Async push delivery |
+| `EMAIL` | Send Email | 3PID email verification via Cloudflare Email Service (optional) |
+
+### Durable Object Migrations (`new_sqlite_classes`)
+
+Every Durable Object class **must** be declared in a `migrations` entry in `wrangler.jsonc` using `new_sqlite_classes` (SQLite-backed storage). This repo declares all eight DO classes across migration tags `v1`–`v6`.
+
+- **When adding a new DO**: export the class from `src/index.ts`, add its binding under `durable_objects.bindings`, and add a **new** migration tag with the class name in `new_sqlite_classes`. Do not edit already-deployed migration tags.
+- **Why `new_sqlite_classes` and not `new_classes`**: `new_classes` creates legacy key-value-backed DOs, which are unavailable on the Workers Free plan and are not what this codebase expects — deploys will fail or the DO gets the wrong storage backend. SQLite-backed DOs are the current Cloudflare recommendation and the only option on the free plan.
+
+The D1 database name in `wrangler.jsonc` is `matrix-db` (binding `DB`); the `db:migrate` npm scripts target that name.
 
 ## Security
 

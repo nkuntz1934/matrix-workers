@@ -21,6 +21,18 @@ interface ReceiptData {
   thread_id?: string;
 }
 
+// Bounds for in-memory maps. Chosen conservatively so a hot room cannot
+// drive a single DO to memory exhaustion / eviction.
+// - MAX_WS_CONNECTIONS: refuse new WebSockets above this threshold (503).
+// - MAX_TYPING_USERS: bound the typing map; expired entries are evicted lazily,
+//   the cap is a safety valve against runaway entries.
+// - MAX_RECEIPTS_CACHE: receipts are 1-per-user-per-type-per-thread by design,
+//   but a cap protects against unbounded growth. LRU-evicted in memory only;
+//   durable storage remains the source of truth.
+const MAX_WS_CONNECTIONS = 500;
+const MAX_TYPING_USERS = 1000;
+const MAX_RECEIPTS_CACHE = 5000;
+
 export class RoomDurableObject extends DurableObject<Env> {
   private sessions: Map<WebSocket, RoomSession> = new Map();
   private roomId: string = '';
@@ -31,8 +43,24 @@ export class RoomDurableObject extends DurableObject<Env> {
   // In-memory receipts cache (also persisted to durable storage)
   // Map of `${userId}:${receiptType}:${threadContext}` -> ReceiptData
   // threadContext is thread_id ?? 'unthreaded'
+  // Iteration order is insertion order, which we rely on for LRU eviction:
+  // a `set()` to an existing key updates the value but does NOT move it,
+  // so we delete-then-set in setReceiptCacheLRU() to refresh recency.
   private receiptsCache: Map<string, ReceiptData> = new Map();
   private receiptsCacheLoaded: boolean = false;
+
+  // LRU set for receiptsCache: refresh recency, then evict oldest if over cap.
+  private setReceiptCacheLRU(key: string, value: ReceiptData): void {
+    if (this.receiptsCache.has(key)) {
+      this.receiptsCache.delete(key);
+    }
+    this.receiptsCache.set(key, value);
+    while (this.receiptsCache.size > MAX_RECEIPTS_CACHE) {
+      const oldest = this.receiptsCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.receiptsCache.delete(oldest);
+    }
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -52,7 +80,7 @@ export class RoomDurableObject extends DurableObject<Env> {
       // Check if this is new format (has user_id in data)
       if (value.user_id) {
         // New format - use key as-is
-        this.receiptsCache.set(keyWithoutPrefix, value);
+        this.setReceiptCacheLRU(keyWithoutPrefix, value);
       } else {
         // Old format - need to add user_id and thread context
         // Old key: {userId}:{receiptType} where userId is @localpart:server
@@ -67,11 +95,11 @@ export class RoomDurableObject extends DurableObject<Env> {
 
           // Backfill user_id into value
           value.user_id = userId;
-          this.receiptsCache.set(newCacheKey, value);
+          this.setReceiptCacheLRU(newCacheKey, value);
         } else {
           // Fallback: just use the key with unthreaded suffix
           const threadContext = value.thread_id ?? 'unthreaded';
-          this.receiptsCache.set(`${keyWithoutPrefix}:${threadContext}`, value);
+          this.setReceiptCacheLRU(`${keyWithoutPrefix}:${threadContext}`, value);
         }
       }
     }
@@ -142,9 +170,9 @@ export class RoomDurableObject extends DurableObject<Env> {
     const receiptData: ReceiptData = { user_id, event_id, receipt_type, ts, thread_id };
     await this.ctx.storage.put(storageKey, receiptData);
 
-    // Update cache
+    // Update cache (LRU-bounded)
     await this.loadReceiptsCache();
-    this.receiptsCache.set(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
+    this.setReceiptCacheLRU(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
 
     // Broadcast to WebSocket clients
     const message = JSON.stringify({
@@ -215,6 +243,21 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (typing) {
       // User started typing - set expiration
       const expiresAt = Date.now() + Math.min(timeout, 120000); // Max 2 minutes
+
+      // Opportunistically evict already-expired entries before checking cap.
+      if (this.typingUsers.size >= MAX_TYPING_USERS) {
+        const now = Date.now();
+        for (const [uid, state] of this.typingUsers) {
+          if (state.expiresAt <= now) this.typingUsers.delete(uid);
+        }
+        // Hard cap: drop oldest insertion if still over (LRU by insertion order).
+        while (this.typingUsers.size >= MAX_TYPING_USERS) {
+          const oldest = this.typingUsers.keys().next().value;
+          if (oldest === undefined) break;
+          this.typingUsers.delete(oldest);
+        }
+      }
+
       this.typingUsers.set(user_id, { expiresAt });
 
       // Broadcast to WebSocket clients
@@ -266,6 +309,13 @@ export class RoomDurableObject extends DurableObject<Env> {
 
     if (!userId || !roomId) {
       return new Response('Missing user_id or room_id', { status: 400 });
+    }
+
+    // Cap concurrent WebSocket connections per room. Hibernated sockets are
+    // included via getWebSockets(), so this counts all live connections.
+    const activeWs = this.ctx.getWebSockets().length;
+    if (activeWs >= MAX_WS_CONNECTIONS) {
+      return new Response('Room WebSocket connection limit reached', { status: 503 });
     }
 
     this.roomId = roomId;
@@ -435,9 +485,9 @@ export class RoomDurableObject extends DurableObject<Env> {
     };
     await this.ctx.storage.put(storageKey, receiptData);
 
-    // Update cache
+    // Update cache (LRU-bounded)
     await this.loadReceiptsCache();
-    this.receiptsCache.set(`${userId}:${receiptType}:${threadContext}`, receiptData);
+    this.setReceiptCacheLRU(`${userId}:${receiptType}:${threadContext}`, receiptData);
 
     // Broadcast to other users
     const message = JSON.stringify({

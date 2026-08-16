@@ -27,6 +27,42 @@ interface RemoteServerKey {
 // Cache TTL for remote server keys (5 minutes for KV, longer in D1)
 const KEY_CACHE_TTL = 5 * 60;
 
+// Maximum staleness for federation signing keys past their valid_until timestamp.
+// Per Matrix spec, keys can be used to verify historical signatures past expiry,
+// but we cap how far past expiry we'll accept a key — beyond this threshold, the
+// key is treated as untrusted (e.g. a compromised rotated key replayed via DNS
+// hijack or a long-broken key server should not silently keep being used).
+// Default: 7 days. Override at runtime via env.FEDERATION_KEY_MAX_STALENESS_MS
+// by passing the override into the helpers below.
+export const DEFAULT_KEY_MAX_STALENESS_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Returns true if the key is too stale to trust for any signature verification.
+ * A key is too stale when it has a valid_until timestamp and the current time
+ * is more than maxStalenessMs past that timestamp.
+ */
+export function isKeyTooStale(
+  validUntil: number | null | undefined,
+  now: number = Date.now(),
+  maxStalenessMs: number = DEFAULT_KEY_MAX_STALENESS_MS
+): boolean {
+  if (!validUntil) return false; // No expiry → not stale
+  return now - validUntil > maxStalenessMs;
+}
+
+/**
+ * Resolve the configured max-staleness threshold from env, falling back to
+ * the default when unset or invalid.
+ */
+export function resolveMaxStalenessMs(env?: { FEDERATION_KEY_MAX_STALENESS_MS?: string }): number {
+  const raw = env?.FEDERATION_KEY_MAX_STALENESS_MS;
+  if (raw) {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_KEY_MAX_STALENESS_MS;
+}
+
 /**
  * Fetch and cache a remote server's signing keys
  */
@@ -91,9 +127,24 @@ export async function fetchRemoteServerKeys(
   } catch (error) {
     console.error(`Failed to fetch keys from ${serverName}:`, error);
 
-    // Fall back to D1 cache even if stale
+    // Fall back to D1 cache only if the keys are not too stale.
+    // An attacker can cause a targeted network failure (DNS poisoning the key
+    // endpoint) to force fallback to a previously cached but now-rotated key.
+    // Reject keys past the configured staleness threshold to bound that window.
     if (dbKeys.results.length > 0) {
-      return dbKeys.results;
+      const maxStaleness = DEFAULT_KEY_MAX_STALENESS_MS;
+      const now = Date.now();
+      const fresh = dbKeys.results.filter((k) => !isKeyTooStale(k.valid_until, now, maxStaleness));
+      const dropped = dbKeys.results.length - fresh.length;
+      if (dropped > 0) {
+        console.warn(
+          `[federation-keys] Dropping ${dropped} stale key(s) for ${serverName} ` +
+          `(beyond ${maxStaleness}ms staleness threshold)`
+        );
+      }
+      if (fresh.length > 0) {
+        return fresh;
+      }
     }
 
     throw new Error(`Cannot fetch signing keys from ${serverName}`);
@@ -415,10 +466,24 @@ export async function verifyRemoteSignature(
     return false;
   }
 
-  // Check key validity
-  if (key.valid_until && key.valid_until < Date.now()) {
-    console.warn(`Key ${serverName}:${keyId} has expired`);
-    // Still try to verify - the key might have been valid when the signature was made
+  // Check key validity. Per Matrix spec, an expired key may still verify
+  // signatures from before the expiry — but we cap how far past expiry we
+  // trust a key. Keys past the staleness threshold are rejected outright to
+  // prevent a compromised, long-rotated key from being replayed under a
+  // network outage.
+  const now = Date.now();
+  const maxStaleness = DEFAULT_KEY_MAX_STALENESS_MS;
+  if (isKeyTooStale(key.valid_until, now, maxStaleness)) {
+    console.warn(
+      `[federation-keys] Rejecting signature: key ${serverName}:${keyId} is too stale ` +
+      `(valid_until=${key.valid_until}, now=${now}, threshold=${maxStaleness}ms)`
+    );
+    return false;
+  }
+
+  if (key.valid_until && key.valid_until < now) {
+    console.warn(`Key ${serverName}:${keyId} has expired but is within staleness threshold`);
+    // Continue — within the spec-allowed grace period
   }
 
   return verifySignature(obj, serverName, keyId, key.public_key);

@@ -2,6 +2,8 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
+import { getServerSigningKey, signFederationRequest } from '../services/federation-keys';
+import { discoverServer, buildServerUrl } from '../services/server-discovery';
 
 interface FederationTarget {
   serverName: string;
@@ -75,6 +77,16 @@ export class FederationDurableObject extends DurableObject<Env> {
       created_at: Date.now(),
       retry_count: 0,
     };
+
+    // Check queue size to prevent unbounded growth when remote server is down
+    const allQueueKeys = await this.ctx.storage.list({ prefix: `queue:${data.destination}:`, limit: 10000 });
+    if (allQueueKeys.size >= 10000) {
+      console.warn(`[federation] Queue for ${data.destination} full (${allQueueKeys.size} events), rejecting`);
+      return new Response(JSON.stringify({
+        errcode: 'M_LIMIT_EXCEEDED',
+        error: 'Federation queue full for destination',
+      }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+    }
 
     // Store in queue
     const key = `queue:${data.destination}:${data.event_id}`;
@@ -268,23 +280,73 @@ export class FederationDurableObject extends DurableObject<Env> {
     }));
 
     try {
-      const response = await fetch(`https://${destination}/_matrix/federation/v1/send/${Date.now()}`, {
+      const txnId = Date.now().toString();
+      const path = `/_matrix/federation/v1/send/${txnId}`;
+      const content = { pdus, edus: eduPayloads };
+
+      // Sign the outbound federation request
+      const signingKey = await getServerSigningKey(this.env.DB);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      if (signingKey) {
+        const authHeader = await signFederationRequest(
+          'PUT',
+          path,
+          this.env.SERVER_NAME,
+          destination,
+          signingKey,
+          content
+        );
+        headers['Authorization'] = authHeader;
+      } else {
+        console.warn(`[federation] No signing key available — sending unsigned request to ${destination}`);
+      }
+
+      // Discover the remote server's endpoint
+      let serverUrl: string;
+      try {
+        const discovery = await discoverServer(destination, this.env.CACHE);
+        serverUrl = buildServerUrl(discovery);
+      } catch {
+        serverUrl = `https://${destination}`;
+      }
+
+      const response = await fetch(`${serverUrl}${path}`, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          pdus,
-          edus: eduPayloads,
-        }),
+        headers,
+        body: JSON.stringify(content),
+        signal: AbortSignal.timeout(30000), // 30 second timeout
       });
 
       if (response.ok) {
-        // Remove sent events from queue
-        for (const event of events) {
-          await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+        // Parse the response to check for per-PDU failures
+        let responseBody: any = {};
+        try {
+          responseBody = await response.json();
+        } catch {
+          // If response body is not JSON, treat all as accepted
         }
-        // Remove sent EDUs
+
+        // Remove accepted events from queue, re-queue rejected ones
+        const pduResults = responseBody?.pdus || {};
+        for (const event of events) {
+          const result = pduResults[event.event_id];
+          if (result?.error) {
+            console.warn(`[federation] PDU ${event.event_id} rejected by ${destination}: ${result.error}`);
+            // Keep in queue for retry unless it's a permanent failure
+            if (event.retry_count >= 32) {
+              console.error(`[federation] Dropping PDU ${event.event_id} after 32 retries to ${destination}`);
+              await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+            }
+          } else {
+            // Accepted — remove from queue
+            await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+          }
+        }
+        // Remove sent EDUs (EDUs are fire-and-forget per spec)
         for (const key of eduKeyNames) {
           await this.ctx.storage.delete(key);
         }
@@ -298,8 +360,24 @@ export class FederationDurableObject extends DurableObject<Env> {
         };
         await this.ctx.storage.put(`server:${destination}`, target);
       } else {
-        // Schedule retry
-        await this.scheduleRetry(destination, events);
+        // Schedule retry (with max retry cap)
+        const maxedOut = events.some(e => e.retry_count >= 32);
+        if (maxedOut) {
+          // Drop events that have exceeded max retries
+          for (const event of events) {
+            if (event.retry_count >= 32) {
+              console.error(`[federation] Dropping PDU ${event.event_id} after ${event.retry_count} retries to ${destination}`);
+              await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+            }
+          }
+          // Re-filter events that still have retries left
+          const remainingEvents = events.filter(e => e.retry_count < 32);
+          if (remainingEvents.length > 0) {
+            await this.scheduleRetry(destination, remainingEvents);
+          }
+        } else {
+          await this.scheduleRetry(destination, events);
+        }
       }
     } catch (e) {
       console.error(`Federation send to ${destination} failed:`, e);
@@ -311,8 +389,8 @@ export class FederationDurableObject extends DurableObject<Env> {
     const target = await this.ctx.storage.get(`server:${destination}`) as FederationTarget | undefined;
     const retryCount = (target?.retryCount || 0) + 1;
 
-    // Exponential backoff: 1min, 2min, 4min, 8min, 16min, max 1hour
-    const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 3600000);
+    // Exponential backoff: 1min, 2min, 4min ... capped at 1 day
+    const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 86400000);
     const nextRetry = Date.now() + delay;
 
     // Update server status

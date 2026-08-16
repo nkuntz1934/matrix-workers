@@ -243,3 +243,62 @@ export async function invalidateBatchRoomCache(
 ): Promise<void> {
   await Promise.all(roomIds.map(roomId => invalidateRoomCache(cache, roomId)));
 }
+
+// Cache generation key — incremented on every metadata-affecting write so
+// that readers can detect stale cached values even if KV deletion fails.
+// See issue #009 sub-finding 4 (cache invalidation failures swallowed).
+const CACHE_GENERATION_KEY_PREFIX = 'room-meta-gen:';
+
+/**
+ * Bump the cache generation counter for a room. Readers that hold a cached
+ * value with a lower generation should treat it as stale.
+ *
+ * This is the secondary defense for cache coherency: even if a subsequent
+ * KV.delete() fails (e.g. transient KV unavailability), the next read will
+ * see a higher generation and refuse to serve the stale entry.
+ */
+export async function bumpRoomCacheGeneration(
+  cache: KVNamespace,
+  roomId: string
+): Promise<number> {
+  const key = `${CACHE_GENERATION_KEY_PREFIX}${roomId}`;
+  // KV doesn't support atomic increment, so read-modify-write. Two concurrent
+  // bumps may collapse into one increment; that's acceptable because the
+  // invariant we care about is monotonicity, not exactness.
+  let current = 0;
+  try {
+    const raw = await cache.get(key);
+    if (raw) {
+      const parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed)) current = parsed;
+    }
+  } catch {
+    // Treat unreadable generation as zero — the bump still moves it forward.
+  }
+  const next = current + 1;
+  try {
+    // Generations don't expire — they need to outlive any cached metadata.
+    await cache.put(key, String(next));
+  } catch (err) {
+    // Re-throw so the caller can decide to log; the calling site uses .catch()
+    throw err;
+  }
+  return next;
+}
+
+/**
+ * Read the current cache generation for a room (0 if unset).
+ */
+export async function getRoomCacheGeneration(
+  cache: KVNamespace,
+  roomId: string
+): Promise<number> {
+  try {
+    const raw = await cache.get(`${CACHE_GENERATION_KEY_PREFIX}${roomId}`);
+    if (!raw) return 0;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}

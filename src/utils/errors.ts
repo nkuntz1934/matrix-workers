@@ -119,6 +119,13 @@ export const Errors = {
   tooLarge(message: string = 'Request too large'): MatrixApiError {
     return new MatrixApiError(ErrorCodes.M_TOO_LARGE, message, 413);
   },
+
+  conflict(message: string = 'State changed concurrently; retry the operation'): MatrixApiError {
+    // 409 Conflict — the auth basis for the request was invalidated by a
+    // concurrent state change. Standard Matrix has no errcode for this case
+    // (see issue 009), so we use a non-standard M_CONFLICT and document it.
+    return new MatrixApiError(ErrorCodes.M_CONFLICT, message, 409);
+  },
 };
 
 // Wrap an async handler with error handling

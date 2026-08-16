@@ -62,6 +62,36 @@ export async function generateEventId(serverName: string, roomVersion?: string):
   return `$${opaque}`;
 }
 
+// Generate a deterministic event ID derived from stable input. Used to make
+// retries of the same logical operation (e.g. a join request) idempotent.
+// Two calls with the same inputs always return the same event ID, so the
+// underlying INSERT OR IGNORE will silently no-op on a duplicate.
+//
+// `bucketSeconds` rounds the timestamp down so quick retries (within the
+// bucket) collapse to the same ID; legitimate distinct operations across
+// buckets still get distinct IDs.
+export async function generateDeterministicEventId(
+  serverName: string,
+  roomId: string,
+  userId: string,
+  operation: string,
+  timestampMs: number,
+  bucketSeconds: number = 1,
+  roomVersion?: string,
+): Promise<EventId> {
+  const bucket = Math.floor(timestampMs / (bucketSeconds * 1000));
+  const seed = `${roomId}|${userId}|${operation}|${bucket}`;
+  const encoder = new TextEncoder();
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(seed));
+  const opaque = base64UrlEncode(new Uint8Array(digest));
+
+  const format = getEventIdFormat(roomVersion);
+  if (format === 'v1') {
+    return `$${opaque.slice(0, 24)}:${serverName}`;
+  }
+  return `$${opaque}`;
+}
+
 // Generate a legacy event ID (room version 1-2)
 export async function generateLegacyEventId(serverName: string): Promise<EventId> {
   const opaque = await generateOpaqueId(18);

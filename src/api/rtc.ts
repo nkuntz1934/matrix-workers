@@ -5,6 +5,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { generateLiveKitToken, getLiveKitConfig } from '../services/livekit';
+import { requireAuth } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
 
@@ -68,24 +69,27 @@ interface GetTokenResponse {
 // Verify OpenID token with the homeserver
 async function verifyOpenIDToken(
   token: OpenIDToken,
-  serverName: string
+  serverName: string,
+  sessionsKv: KVNamespace
 ): Promise<{ sub: string } | null> {
   try {
-    // The OpenID token should be verified against the homeserver
-    // For our own homeserver, we can verify it directly
     if (token.matrix_server_name !== serverName) {
-      console.log('Token from different server:', token.matrix_server_name);
-      // For federated calls, we'd need to verify with the remote server
-      // For now, we only accept tokens from our own server
+      console.warn('[rtc] Rejecting OpenID token from different server:', token.matrix_server_name);
       return null;
     }
 
-    // For our own tokens, we trust them if they came from our server
-    // In production, you'd want to validate the token signature or check against storage
-    // For simplicity, we'll accept tokens that match our server name
-    return { sub: token.access_token };
+    // Verify the OpenID token against our local session store
+    const tokenData = await sessionsKv.get(`openid:${token.access_token}`);
+    if (tokenData) {
+      const parsed = JSON.parse(tokenData);
+      return { sub: parsed.user_id || parsed.sub };
+    }
+
+    // Token not found in our store — reject
+    console.warn('[rtc] OpenID token not found in session store');
+    return null;
   } catch (error) {
-    console.error('Error verifying OpenID token:', error);
+    console.error('[rtc] Error verifying OpenID token:', error);
     return null;
   }
 }
@@ -99,7 +103,8 @@ function roomIdToLiveKitName(roomId: string): string {
 
 // POST /livekit/get_token - Get a LiveKit JWT token
 // This is the endpoint that Element X calls to get call credentials
-app.post('/livekit/get_token', async (c) => {
+app.post('/livekit/get_token', requireAuth(), async (c) => {
+  const userId = c.get('userId');
   const config = getLiveKitConfig(c.env);
   if (!config) {
     return c.json(
@@ -122,33 +127,25 @@ app.post('/livekit/get_token', async (c) => {
   const roomId = body.room_id || body.room;
 
   // Validate required fields
-  if (!roomId || !body.openid_token) {
+  if (!roomId) {
     return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Missing required fields: room and openid_token' },
+      { errcode: 'M_BAD_JSON', error: 'Missing required field: room' },
       400
     );
   }
 
-  // Verify the OpenID token (simplified for now)
-  // In production, you'd verify the token cryptographically
-  const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME);
-  if (!verified) {
-    // For now, accept all tokens from our server's clients
-    // This is a simplification - in production you'd verify properly
-    console.log('OpenID token verification skipped for development');
+  // Verify the OpenID token if provided (additional verification layer)
+  if (body.openid_token) {
+    const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME, c.env.SESSIONS);
+    if (!verified) {
+      console.warn(`[rtc] OpenID token verification failed for ${userId}`);
+    }
   }
 
-  // Generate participant identity - use access_token as identity if no member info
-  let participantId: string;
-  let participantName: string;
-
-  if (body.member) {
-    participantId = body.member.claimed_user_id;
-    participantName = participantId.split(':')[0].replace('@', '');
-  } else {
-    participantId = body.device_id || body.openid_token.access_token.substring(0, 16);
-    participantName = body.device_id || 'participant';
-  }
+  // Use the authenticated user's identity — never trust client-supplied identity
+  const participantId = userId;
+  const participantName = userId.split(':')[0].replace('@', '');
+  void (body.device_id || c.get('deviceId')); // deviceId available for future per-device tracking
 
   // Convert Matrix room ID to LiveKit room name
   const liveKitRoom = roomIdToLiveKitName(roomId);
@@ -193,12 +190,11 @@ app.options('/livekit/get_token', () => {
 
 // POST /livekit/get_token/sfu/get - Alternative endpoint format used by Element X
 // This is the same as /livekit/get_token but with /sfu/get suffix
-app.post('/livekit/get_token/sfu/get', async (c) => {
-  console.log('[LiveKit] /sfu/get request received');
+app.post('/livekit/get_token/sfu/get', requireAuth(), async (c) => {
+  const userId = c.get('userId');
 
   const config = getLiveKitConfig(c.env);
   if (!config) {
-    console.log('[LiveKit] Config missing - API_KEY:', !!c.env.LIVEKIT_API_KEY, 'API_SECRET:', !!c.env.LIVEKIT_API_SECRET, 'URL:', !!c.env.LIVEKIT_URL);
     return c.json(
       { errcode: 'M_UNKNOWN', error: 'LiveKit not configured' },
       500
@@ -207,11 +203,8 @@ app.post('/livekit/get_token/sfu/get', async (c) => {
 
   let body: GetTokenRequest;
   try {
-    const rawBody = await c.req.text();
-    console.log('[LiveKit] Raw body length:', rawBody.length, 'preview:', rawBody.substring(0, 200));
-    body = JSON.parse(rawBody);
-  } catch (e) {
-    console.log('[LiveKit] JSON parse error:', e);
+    body = await c.req.json();
+  } catch {
     return c.json(
       { errcode: 'M_BAD_JSON', error: 'Invalid JSON body' },
       400
@@ -222,34 +215,25 @@ app.post('/livekit/get_token/sfu/get', async (c) => {
   const roomId = body.room_id || body.room;
 
   // Validate required fields
-  if (!roomId || !body.openid_token) {
-    console.log('[LiveKit] Missing fields - room_id:', !!body.room_id, 'room:', !!body.room, 'openid_token:', !!body.openid_token);
+  if (!roomId) {
     return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Missing required fields: room and openid_token' },
+      { errcode: 'M_BAD_JSON', error: 'Missing required field: room' },
       400
     );
   }
 
-  // Verify the OpenID token (simplified for now)
-  const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME);
-  if (!verified) {
-    console.log('OpenID token verification skipped for development');
+  // Verify the OpenID token if provided (additional verification layer)
+  if (body.openid_token) {
+    const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME, c.env.SESSIONS);
+    if (!verified) {
+      console.warn(`[rtc] OpenID token verification failed for ${userId}`);
+    }
   }
 
-  // Generate participant identity - use access_token as identity if no member info
-  // Element X doesn't send member info, just device_id
-  let participantId: string;
-  let participantName: string;
-
-  if (body.member) {
-    participantId = body.member.claimed_user_id;
-    participantName = participantId.split(':')[0].replace('@', '');
-  } else {
-    // For Element X, derive identity from openid_token
-    // The access_token's user can be looked up, but for simplicity use device_id
-    participantId = body.device_id || body.openid_token.access_token.substring(0, 16);
-    participantName = body.device_id || 'participant';
-  }
+  // Use the authenticated user's identity — never trust client-supplied identity
+  const participantId = userId;
+  const participantName = userId.split(':')[0].replace('@', '');
+  void (body.device_id || c.get('deviceId')); // deviceId available for future per-device tracking
 
   // Convert Matrix room ID to LiveKit room name
   const liveKitRoom = roomIdToLiveKitName(roomId);

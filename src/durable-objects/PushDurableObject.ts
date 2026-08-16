@@ -214,10 +214,11 @@ export class PushDurableObject extends DurableObject<Env> {
     // Generate new JWT using Web Crypto API
     const token = await this.generateAPNsJWT(keyId, teamId, privateKey);
 
-    // Cache for 50 minutes (APNs accepts tokens up to 1 hour old)
+    // Cache for 30 minutes (APNs accepts tokens up to 1 hour old).
+    // 30 min provides a safe buffer for clock skew and key rotation.
     this.jwtCache = {
       token,
-      expiresAt: now + (50 * 60),
+      expiresAt: now + (30 * 60),
     };
 
     return token;

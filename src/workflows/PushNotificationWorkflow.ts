@@ -426,6 +426,7 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(notification),
+        signal: AbortSignal.timeout(10000), // 10 second timeout
       });
 
       if (response.ok) {

@@ -1,0 +1,44 @@
+name: Bug
+description: Something isn't working
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: spec_area
+    attributes:
+      label: Spec Area
+      options: [Auth, Events, Rooms, Sync, Media, Federation, Push, Search, Admin, Core]
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: [Critical, High, Medium, Low]
+    validations:
+      required: true
+  - type: dropdown
+    id: effort
+    attributes:
+      label: Effort
+      options: [XS, S, M, L, XL]
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+  - type: textarea
+    id: spec_ref
+    attributes:
+      label: Matrix spec reference (if applicable)
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce

@@ -35,7 +35,18 @@ function getRateLimitType(path: string, method: string): string {
   return 'default';
 }
 
-// Get client identifier (IP or user ID)
+// Get client identifier (IP or user ID).
+//
+// IP source trust:
+//   - `CF-Connecting-IP` is set by Cloudflare's edge and is authoritative
+//     when the worker is reached via Cloudflare. We always prefer it.
+//   - `X-Forwarded-For` is client-spoofable when the worker is reached
+//     directly. We only fall back to it when `TRUST_FORWARDED_FOR=true` is
+//     explicitly configured (i.e. the operator is fronting the worker with
+//     another trusted proxy that rewrites XFF).
+//   - When no trusted IP source is available we use a single 'unknown' bucket.
+//     This is intentionally a strict shared bucket — if you see legitimate
+//     'unknown' traffic, fix the deployment to expose a trusted IP source.
 function getClientId(c: Context<AppEnv>): string {
   // Try to get user ID first (for authenticated requests)
   const userId = c.get('userId');
@@ -43,12 +54,23 @@ function getClientId(c: Context<AppEnv>): string {
     return `user:${userId}`;
   }
 
-  // Fall back to IP address
+  // Always prefer the Cloudflare-set header.
   const cfConnectingIp = c.req.header('CF-Connecting-IP');
-  const xForwardedFor = c.req.header('X-Forwarded-For');
-  const ip = cfConnectingIp || xForwardedFor?.split(',')[0]?.trim() || 'unknown';
+  if (cfConnectingIp) {
+    return `ip:${cfConnectingIp}`;
+  }
 
-  return `ip:${ip}`;
+  // Fall back to X-Forwarded-For only if the operator opts in.
+  const trustForwarded = c.env.TRUST_FORWARDED_FOR === 'true';
+  if (trustForwarded) {
+    const xForwardedFor = c.req.header('X-Forwarded-For');
+    const xff = xForwardedFor?.split(',')[0]?.trim();
+    if (xff) {
+      return `ip:${xff}`;
+    }
+  }
+
+  return 'ip:unknown';
 }
 
 // Rate limiter using Durable Objects

@@ -12,7 +12,7 @@ const app = new Hono<AppEnv>();
 // Maximum upload size (50MB)
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
-// Supported MIME types (used for validation in future)
+// Supported MIME types for upload validation
 export const SUPPORTED_TYPES = [
   'image/jpeg',
   'image/png',
@@ -22,6 +22,7 @@ export const SUPPORTED_TYPES = [
   'video/mp4',
   'video/webm',
   'audio/mp3',
+  'audio/mpeg',
   'audio/ogg',
   'audio/wav',
   'audio/webm',
@@ -31,6 +32,25 @@ export const SUPPORTED_TYPES = [
   'application/octet-stream',
 ];
 
+// Sanitize a filename for safe use in Content-Disposition headers.
+// Strips characters that could enable header injection or path traversal.
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+}
+
+// Build a safe Content-Disposition header value using RFC 5987 encoding
+function safeContentDisposition(filename: string): string {
+  const sanitized = sanitizeFilename(filename);
+  return `inline; filename="${sanitized}"`;
+}
+
+// Add security headers to all media responses
+function addMediaSecurityHeaders(headers: Headers): void {
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+  headers.set('X-Frame-Options', 'DENY');
+}
+
 // POST /_matrix/media/v3/upload - Upload media
 app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -39,7 +59,12 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const contentType = c.req.header('Content-Type') || 'application/octet-stream';
   const filename = c.req.query('filename');
 
-  // Check content length
+  // Validate MIME type against whitelist
+  if (!SUPPORTED_TYPES.includes(contentType.split(';')[0].trim())) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${contentType.split(';')[0].trim()}` }, 403);
+  }
+
+  // Early rejection based on Content-Length header (may be absent or falsified)
   const contentLength = parseInt(c.req.header('Content-Length') || '0');
   if (contentLength > MAX_UPLOAD_SIZE) {
     return Errors.tooLarge('File exceeds maximum upload size').toResponse();
@@ -49,8 +74,14 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const mediaId = await generateOpaqueId(24);
   const mxcUri = `mxc://${c.env.SERVER_NAME}/${mediaId}`;
 
-  // Get the raw body
+  // Get the raw body and verify actual size
   const body = await c.req.arrayBuffer();
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
+
+  // Sanitize filename for storage
+  const safeFilename = filename ? sanitizeFilename(filename) : '';
 
   // Store in R2
   await c.env.MEDIA.put(mediaId, body, {
@@ -59,7 +90,7 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
     },
     customMetadata: {
       userId,
-      filename: filename || '',
+      filename: safeFilename,
       uploadedAt: Date.now().toString(),
     },
   });
@@ -68,7 +99,7 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO media (media_id, user_id, content_type, content_length, filename, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(mediaId, userId, contentType, body.byteLength, filename || null, Date.now()).run();
+  ).bind(mediaId, userId, contentType, body.byteLength, safeFilename || null, Date.now()).run();
 
   return c.json({
     content_uri: mxcUri,
@@ -99,9 +130,10 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
   const headers = new Headers();
   headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
   if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
+    headers.set('Content-Disposition', safeContentDisposition(metadata.filename));
   }
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
 
   return new Response(object.body, { headers });
 });
@@ -130,8 +162,9 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
 
   const headers = new Headers();
   headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
+  headers.set('Content-Disposition', safeContentDisposition(requestedFilename));
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
 
   return new Response(object.body, { headers });
 });
@@ -140,8 +173,8 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
 app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
-  const width = Math.min(parseInt(c.req.query('width') || '96'), 1920);
-  const height = Math.min(parseInt(c.req.query('height') || '96'), 1920);
+  const width = Math.max(1, Math.min(parseInt(c.req.query('width') || '96', 10) || 96, 1920));
+  const height = Math.max(1, Math.min(parseInt(c.req.query('height') || '96', 10) || 96, 1920));
   const method = c.req.query('method') || 'scale';
 
   // Only serve local media for now
@@ -426,6 +459,11 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
   const contentType = c.req.header('Content-Type') || 'application/octet-stream';
   const filename = c.req.query('filename');
 
+  // Validate MIME type against whitelist
+  if (!SUPPORTED_TYPES.includes(contentType.split(';')[0].trim())) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: `Unsupported content type: ${contentType.split(';')[0].trim()}` }, 403);
+  }
+
   const contentLength = parseInt(c.req.header('Content-Length') || '0');
   if (contentLength > MAX_UPLOAD_SIZE) {
     return Errors.tooLarge('File exceeds maximum upload size').toResponse();
@@ -435,12 +473,17 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
   const mxcUri = `mxc://${c.env.SERVER_NAME}/${mediaId}`;
 
   const body = await c.req.arrayBuffer();
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
+
+  const safeFilename = filename ? sanitizeFilename(filename) : '';
 
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: { contentType },
     customMetadata: {
       userId,
-      filename: filename || '',
+      filename: safeFilename,
       uploadedAt: Date.now().toString(),
     },
   });
@@ -448,7 +491,7 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO media (media_id, user_id, content_type, content_length, filename, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(mediaId, userId, contentType, body.byteLength, filename || null, Date.now()).run();
+  ).bind(mediaId, userId, contentType, body.byteLength, safeFilename || null, Date.now()).run();
 
   return c.json({ content_uri: mxcUri });
 });
@@ -544,9 +587,10 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
   const headers = new Headers();
   headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
   if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
+    headers.set('Content-Disposition', safeContentDisposition(metadata.filename));
   }
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
 
   return new Response(object.body, { headers });
 });
@@ -572,8 +616,9 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
 
   const headers = new Headers();
   headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
+  headers.set('Content-Disposition', safeContentDisposition(requestedFilename));
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
 
   return new Response(object.body, { headers });
 });
@@ -582,8 +627,8 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
 app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
-  const width = Math.min(parseInt(c.req.query('width') || '96'), 1920);
-  const height = Math.min(parseInt(c.req.query('height') || '96'), 1920);
+  const width = Math.max(1, Math.min(parseInt(c.req.query('width') || '96', 10) || 96, 1920));
+  const height = Math.max(1, Math.min(parseInt(c.req.query('height') || '96', 10) || 96, 1920));
   const method = c.req.query('method') || 'scale';
 
   if (serverName !== c.env.SERVER_NAME) {

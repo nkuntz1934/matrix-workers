@@ -411,6 +411,10 @@ export const ErrorCodes = {
   M_EXCLUSIVE: 'M_EXCLUSIVE',
   M_RESOURCE_LIMIT_EXCEEDED: 'M_RESOURCE_LIMIT_EXCEEDED',
   M_CANNOT_LEAVE_SERVER_NOTICE_ROOM: 'M_CANNOT_LEAVE_SERVER_NOTICE_ROOM',
+  // Optimistic-concurrency conflict on a state event write — the auth basis
+  // (power levels / membership) changed between the permission check and the
+  // attempted write. Clients should re-fetch state and retry.
+  M_CONFLICT: 'M_CONFLICT',
 } as const;
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];

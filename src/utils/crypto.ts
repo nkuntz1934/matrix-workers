@@ -35,6 +35,17 @@ export async function hashPassword(password: string): Promise<string> {
   return `$pbkdf2-sha256$100000$${saltB64}$${hashB64}`;
 }
 
+// Constant-time string comparison to prevent timing attacks.
+// Returns true if strings are equal, using XOR to avoid short-circuit evaluation.
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 // Verify a password against a hash
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
   const parts = storedHash.split('$');
@@ -43,6 +54,14 @@ export async function verifyPassword(password: string, storedHash: string): Prom
   }
 
   const iterations = parseInt(parts[2], 10);
+
+  // Validate iteration count is within acceptable range to prevent
+  // accepting weakened hashes if the database is tampered with
+  if (isNaN(iterations) || iterations < 100000 || iterations > 2000000) {
+    console.error(`[crypto] Rejecting stored hash with invalid iteration count: ${parts[2]}`);
+    return false;
+  }
+
   const salt = Uint8Array.from(atob(parts[3]), c => c.charCodeAt(0));
   const expectedHash = parts[4];
 
@@ -67,7 +86,7 @@ export async function verifyPassword(password: string, storedHash: string): Prom
   );
 
   const hashB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
-  return hashB64 === expectedHash;
+  return timingSafeEqual(hashB64, expectedHash);
 }
 
 // SHA-256 hash
@@ -302,6 +321,24 @@ export async function verifyContentHash(
 ): Promise<boolean> {
   const actualHash = await calculateContentHash(content);
   return actualHash === expectedHash;
+}
+
+// Validate password strength. Returns null if valid, or an error message.
+export function validatePasswordStrength(password: string): string | null {
+  if (!password || password.length < 8) {
+    return 'Password must be at least 8 characters long';
+  }
+  if (password.length > 1000) {
+    return 'Password must be at most 1000 characters long';
+  }
+  // Check for at least one letter and one number/symbol for basic complexity
+  if (!/[a-zA-Z]/.test(password)) {
+    return 'Password must contain at least one letter';
+  }
+  if (!/[0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+    return 'Password must contain at least one number or special character';
+  }
+  return null;
 }
 
 // Generate a random string for CSRF tokens, etc.

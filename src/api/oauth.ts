@@ -373,7 +373,9 @@ app.post('/oauth/token', async (c) => {
       return c.json({ error: 'invalid_client', error_description: 'client_secret is required' }, 401);
     }
     const secretHash = await hashClientSecret(effectiveClientSecret);
-    if (secretHash !== client.client_secret_hash) {
+    // Use constant-time comparison to prevent timing attacks
+    const { timingSafeEqual } = await import('../utils/crypto');
+    if (!timingSafeEqual(secretHash, client.client_secret_hash)) {
       return c.json({ error: 'invalid_client', error_description: 'Invalid client credentials' }, 401);
     }
   }

@@ -1,185 +1,155 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "matrix-worker",
-  "main": "src/index.ts",
-  "compatibility_date": "2024-11-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "account_id": "870e8509c92b6115e64a0cd8bb95ea97",
-
-  "observability": {
-    "enabled": true
-  },
-
-  // D1 Database for relational data (users, rooms, events, memberships)
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "tuwunel-db",
-      "database_id": "36b31035-03de-40ed-8940-753d325bae27"
-    }
-  ],
-
-  // KV Namespaces for fast lookups
-  "kv_namespaces": [
-    {
-      "binding": "SESSIONS",
-      "id": "366e0561b7054c2ebb07ceb44e8f92a5"
-    },
-    {
-      "binding": "DEVICE_KEYS",
-      "id": "9c44be58428049ddbc69727e0e0ff3ef"
-    },
-    {
-      "binding": "CACHE",
-      "id": "121081991bbb4b44806dd973ea185404"
-    },
-    {
-      "binding": "CROSS_SIGNING_KEYS",
-      "id": "b3f387bf735b4fc684a25656f1808abc"
-    },
-    {
-      "binding": "ACCOUNT_DATA",
-      "id": "326dab002ae54bc7a10b99daad566670"
-    },
-    {
-      "binding": "ONE_TIME_KEYS",
-      "id": "c3739acd328748f5a966c3b7ff2a6352"
-    }
-  ],
-
-  // R2 Bucket for media storage
-  "r2_buckets": [
-    {
-      "binding": "MEDIA",
-      "bucket_name": "tuwunel-media"
-    }
-  ],
-
-  // Durable Objects for real-time sync and room coordination
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "ROOMS",
-        "class_name": "RoomDurableObject"
-      },
-      {
-        "name": "SYNC",
-        "class_name": "SyncDurableObject"
-      },
-      {
-        "name": "FEDERATION",
-        "class_name": "FederationDurableObject"
-      },
-      {
-        "name": "CALL_ROOMS",
-        "class_name": "CallRoomDurableObject"
-      },
-      {
-        "name": "ADMIN",
-        "class_name": "AdminDurableObject"
-      },
-      {
-        "name": "USER_KEYS",
-        "class_name": "UserKeysDurableObject"
-      },
-      {
-        "name": "PUSH",
-        "class_name": "PushDurableObject"
-      },
-      {
-        "name": "RATE_LIMIT",
-        "class_name": "RateLimitDurableObject"
-      }
-    ]
-  },
-
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["RoomDurableObject", "SyncDurableObject", "FederationDurableObject"]
-    },
-    {
-      "tag": "v2",
-      "new_classes": ["CallRoomDurableObject"]
-    },
-    {
-      "tag": "v3",
-      "new_classes": ["AdminDurableObject"]
-    },
-    {
-      "tag": "v4",
-      "new_classes": ["UserKeysDurableObject"]
-    },
-    {
-      "tag": "v5",
-      "new_classes": ["PushDurableObject"]
-    },
-    {
-      "tag": "v6",
-      "new_classes": ["RateLimitDurableObject"]
-    }
-  ],
-
-  // Environment variables
-  "vars": {
-    "SERVER_NAME": "m.easydemo.org",
-    "SERVER_VERSION": "0.1.0",
-    "TURN_KEY_ID": "42586a3b6b8415d1e69e825f169f3108",
-    "LIVEKIT_API_KEY": "devkey",
-    "LIVEKIT_URL": "wss://livekit.easydemo.org"
-  },
-
-  // Secrets should be set using:
-  // npx wrangler secret put TURN_API_TOKEN
-  // npx wrangler secret put CALLS_APP_ID
-  // npx wrangler secret put CALLS_APP_SECRET
-  // npx wrangler secret put LIVEKIT_API_SECRET
-  //
-  // For email verification (3PID) via Cloudflare Email Service:
-  // npx wrangler secret put EMAIL_FROM       # From address (e.g., "noreply@m.easydemo.org")
-  //
-  // For direct APNs push notifications (optional - bypasses Sygnal):
-  // npx wrangler secret put APNS_KEY_ID      # Key ID from Apple Developer Portal
-  // npx wrangler secret put APNS_TEAM_ID     # Apple Developer Team ID
-  // npx wrangler secret put APNS_PRIVATE_KEY # Contents of .p8 file
-  // npx wrangler secret put APNS_ENVIRONMENT # "production" or "sandbox" (default: production)
-  //
-  // To create a Cloudflare Realtime SFU app:
-  // 1. Go to https://dash.cloudflare.com/?to=/:account/calls
-  // 2. Create a new Realtime App
-  // 3. Copy the App ID and App Secret
-  // Or use the API: https://developers.cloudflare.com/api/resources/calls/subresources/sfu/methods/create/
-
-  // Custom domain routing
-  "routes": [
-    {
-      "pattern": "m.easydemo.org",
-      "custom_domain": true
-    }
-  ],
-
-  // Workers VPC for LiveKit connectivity
-  "vpc_services": [
-    {
-      "binding": "LIVEKIT_API",
-      "service_id": "019b6a8b-4d9e-7751-bef5-7d9a3f1807a9"
-    }
-  ],
-
-  // Cloudflare Email Service for 3PID email verification
-  "send_email": [{ "name": "EMAIL", "remote": true }],
-
-  // Cloudflare Workflows for durable multi-step operations
-  "workflows": [
-    {
-      "name": "room-join-workflow",
-      "binding": "ROOM_JOIN_WORKFLOW",
-      "class_name": "RoomJoinWorkflow"
-    },
-    {
-      "name": "push-notification-workflow",
-      "binding": "PUSH_NOTIFICATION_WORKFLOW",
-      "class_name": "PushNotificationWorkflow"
-    }
-  ]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "matrix-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-01-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "matrix-db",
+			"database_id": "8e82a6bc-1039-4ad0-a36e-f147bbdb643f"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "SESSIONS",
+			"id": "ef547d1e42674e1f9bb35c4c89848a7c"
+		},
+		{
+			"binding": "DEVICE_KEYS",
+			"id": "53ca37df93b24b6f8f4f5a7ad490b55a"
+		},
+		{
+			"binding": "CACHE",
+			"id": "9d5ceabf7d7840a9842b48d4a29766e5"
+		},
+		{
+			"binding": "CROSS_SIGNING_KEYS",
+			"id": "661f21089f2148f9a73e64b522640a79"
+		},
+		{
+			"binding": "ACCOUNT_DATA",
+			"id": "398d160e2adf4ff6b3f8a28b4bbf0c38"
+		},
+		{
+			"binding": "ONE_TIME_KEYS",
+			"id": "eabb6bc6f03f423aa30e0490196fa26c"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA",
+			"bucket_name": "matrix-media"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ROOMS",
+				"class_name": "RoomDurableObject"
+			},
+			{
+				"name": "SYNC",
+				"class_name": "SyncDurableObject"
+			},
+			{
+				"name": "FEDERATION",
+				"class_name": "FederationDurableObject"
+			},
+			{
+				"name": "CALL_ROOMS",
+				"class_name": "CallRoomDurableObject"
+			},
+			{
+				"name": "ADMIN",
+				"class_name": "AdminDurableObject"
+			},
+			{
+				"name": "USER_KEYS",
+				"class_name": "UserKeysDurableObject"
+			},
+			{
+				"name": "PUSH",
+				"class_name": "PushDurableObject"
+			},
+			{
+				"name": "RATE_LIMIT",
+				"class_name": "RateLimitDurableObject"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"RoomDurableObject",
+				"SyncDurableObject",
+				"FederationDurableObject"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"CallRoomDurableObject"
+			]
+		},
+		{
+			"tag": "v3",
+			"new_sqlite_classes": [
+				"AdminDurableObject"
+			]
+		},
+		{
+			"tag": "v4",
+			"new_sqlite_classes": [
+				"UserKeysDurableObject"
+			]
+		},
+		{
+			"tag": "v5",
+			"new_sqlite_classes": [
+				"PushDurableObject"
+			]
+		},
+		{
+			"tag": "v6",
+			"new_sqlite_classes": [
+				"RateLimitDurableObject"
+			]
+		}
+	],
+	"vars": {
+		"SERVER_NAME": "matrix.fuzzywigg.com",
+		"SERVER_VERSION": "0.1.0"
+	},
+	"routes": [
+		{
+			"pattern": "matrix.fuzzywigg.com",
+			"custom_domain": true
+		}
+	],
+	"send_email": [
+		{
+			"name": "EMAIL",
+			"remote": true
+		}
+	],
+	"workflows": [
+		{
+			"name": "room-join-workflow",
+			"binding": "ROOM_JOIN_WORKFLOW",
+			"class_name": "RoomJoinWorkflow"
+		},
+		{
+			"name": "push-notification-workflow",
+			"binding": "PUSH_NOTIFICATION_WORKFLOW",
+			"class_name": "PushNotificationWorkflow"
+		}
+	]
 }

@@ -18,6 +18,33 @@ import { resolveState } from '../services/state-resolution';
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
 
+// "Modern" room versions for the purpose of content-hash enforcement.
+// Matrix room versions 3 and later require event integrity via hashes.sha256;
+// versions 1 and 2 are legacy where hashes are optional.
+// Issue 006.6 — see docs/issues/006-federation-event-validation-state-resolution.md
+function isModernRoomVersion(version: string): boolean {
+  // Numeric room versions: anything >= 3 counts as modern. Non-numeric custom
+  // versions are treated as modern by default (fail-closed).
+  const n = parseInt(version, 10);
+  if (Number.isFinite(n)) return n >= 3;
+  return true;
+}
+
+/**
+ * Get the request body from either the federation auth middleware buffer
+ * (which already consumed it for signature verification) or from c.req.json()
+ * as a fallback for endpoints not behind federation auth.
+ */
+async function getFederationBody<T = any>(c: any): Promise<T> {
+  // The federation auth middleware stores the parsed body on the context
+  const buffered = c.get('federationBody');
+  if (buffered !== undefined) {
+    return buffered as T;
+  }
+  // Fallback: body wasn't consumed by middleware (e.g., unauthenticated endpoint)
+  return await c.req.json() as T;
+}
+
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/federation/v1/version - Server version info (unauthenticated)
@@ -205,7 +232,7 @@ app.post('/_matrix/key/v2/query', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -495,7 +522,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -568,19 +595,60 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           if (signatureValid) break;
         }
 
-        if (!signatureValid && pduOrigin !== origin) {
-          // PDU from third party without valid signature
-          pduResults[eventId] = { error: 'Invalid signature' };
+        if (!signatureValid) {
+          // Reject ALL PDUs with invalid signatures, regardless of origin.
+          // A PDU from the sending server's own origin must still be properly signed.
+          const reason = pduOrigin !== origin
+            ? 'Third-party PDU without valid signature'
+            : 'PDU from origin server without valid signature';
+          pduResults[eventId] = { error: reason };
           await c.env.DB.prepare(
             `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
              VALUES (?, ?, ?, ?, 0, ?)`
-          ).bind(eventId, pduOrigin, roomId, Date.now(), 'Invalid signature').run();
+          ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
           continue;
         }
       }
 
-      // Verify content hash if present
-      if (pdu.hashes?.sha256) {
+      // Check if the room exists locally — needed before the content-hash
+      // requirement check so we can pick the right enforcement level for
+      // the room version.
+      const room = await c.env.DB.prepare(
+        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+      ).bind(roomId).first<{ room_id: string; room_version: string }>();
+
+      // Content hash enforcement.
+      //   - Room versions 1-2: hashes optional (legacy clients may omit).
+      //   - Room versions 3+: hashes.sha256 is REQUIRED — modern room versions
+      //     mandate content integrity. An attacker can otherwise omit `hashes`
+      //     entirely to skip integrity verification.
+      // If the room is unknown locally, default to the strict (modern) rule —
+      // we won't accept unverifiable events for rooms we know nothing about.
+      const roomVersion = room?.room_version;
+      const requiresHash = !roomVersion || isModernRoomVersion(roomVersion);
+      const hasSha256 = typeof pdu.hashes?.sha256 === 'string' && pdu.hashes.sha256.length > 0;
+
+      if (requiresHash && !hasSha256) {
+        const reason = `Missing required hashes.sha256 (room_version=${roomVersion ?? 'unknown'})`;
+        pduResults[eventId] = { error: reason };
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 0, ?)`
+        ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+        continue;
+      }
+
+      if (!hasSha256 && roomVersion) {
+        // Room versions 1-2: legacy, hashes optional but log so we notice.
+        console.warn(
+          `[federation] PDU ${eventId} from ${pduOrigin} in legacy room_version=${roomVersion} ` +
+          `has no content hash`
+        );
+      }
+
+      // Verify content hash if present (always — even for legacy room versions
+      // when the sender did supply one).
+      if (hasSha256) {
         try {
           const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
           if (!hashValid) {
@@ -593,13 +661,20 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           }
         } catch (hashErr) {
           console.warn(`[federation] Content hash check failed for ${eventId}:`, hashErr);
+          // For modern room versions, refuse to accept an event whose hash we
+          // could not verify — silent fall-through here would defeat the
+          // requirement above.
+          if (requiresHash) {
+            const reason = 'Content hash verification error';
+            pduResults[eventId] = { error: reason };
+            await c.env.DB.prepare(
+              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+               VALUES (?, ?, ?, ?, 0, ?)`
+            ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+            continue;
+          }
         }
       }
-
-      // Check if the room exists locally
-      const room = await c.env.DB.prepare(
-        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
       // Run event authorization check if we have room state
       if (room) {
@@ -1070,11 +1145,13 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
   }
 
   // Build auth chain by recursively collecting auth events
+  // Cap at 500 events to prevent unbounded memory consumption
+  const MAX_AUTH_CHAIN_SIZE = 500;
   const authChain: PDU[] = [];
   const visited = new Set<string>();
   const toProcess = JSON.parse(event.auth_events) as string[];
 
-  while (toProcess.length > 0) {
+  while (toProcess.length > 0 && authChain.length < MAX_AUTH_CHAIN_SIZE) {
     const authId = toProcess.shift()!;
     if (visited.has(authId)) continue;
     visited.add(authId);
@@ -1132,7 +1209,8 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
 // GET /_matrix/federation/v1/backfill/:roomId - Fetch historical events
 app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
-  const limit = Math.min(parseInt(c.req.query('limit') || '100', 10), 1000);
+  const rawLimit = parseInt(c.req.query('limit') || '100', 10);
+  const limit = Math.max(1, Math.min(isNaN(rawLimit) ? 100 : rawLimit, 1000));
   const vParam = c.req.query('v'); // Starting event IDs
 
   // Verify room exists
@@ -1144,8 +1222,19 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Parse starting event IDs
-  const startEventIds = vParam ? vParam.split(',') : [];
+  // Verify the requesting server has membership in this room
+  const origin = (c as any).get('federationOrigin');
+  if (origin) {
+    const hasMember = await c.env.DB.prepare(
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND SUBSTR(user_id, INSTR(user_id, ':') + 1) = ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, origin).first();
+    if (!hasMember) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
+    }
+  }
+
+  // Parse starting event IDs (cap at 20 to prevent oversized IN queries)
+  const startEventIds = vParam ? vParam.split(',').slice(0, 20) : [];
 
   let events: any[];
   if (startEventIds.length > 0) {
@@ -1210,13 +1299,13 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
 
-  const earliestEvents = body.earliest_events || [];
-  const latestEvents = body.latest_events || [];
+  const earliestEvents = (body.earliest_events || []).slice(0, 20);
+  const latestEvents = (body.latest_events || []).slice(0, 20);
   const limit = Math.min(body.limit || 10, 100);
   const minDepth = body.min_depth || 0;
 
@@ -1227,6 +1316,17 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Verify the requesting server has membership in this room
+  const missingEventsOrigin = (c as any).get('federationOrigin');
+  if (missingEventsOrigin) {
+    const hasMember = await c.env.DB.prepare(
+      `SELECT 1 FROM room_memberships WHERE room_id = ? AND SUBSTR(user_id, INSTR(user_id, ':') + 1) = ? AND membership = 'join' LIMIT 1`
+    ).bind(roomId, missingEventsOrigin).first();
+    if (!hasMember) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
+    }
   }
 
   // Walk backwards from latest_events to earliest_events
@@ -1364,7 +1464,7 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1448,7 +1548,7 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1630,7 +1730,7 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1671,7 +1771,7 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1719,7 +1819,7 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1739,6 +1839,16 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
       400
+    );
+  }
+
+  // Validate the sender belongs to the authenticated origin server
+  const inviteOrigin = (c as any).get('federationOrigin');
+  const senderServer = inviteEvent.sender?.split(':')[1];
+  if (inviteOrigin && senderServer && senderServer !== inviteOrigin) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'Sender does not belong to the authenticated origin server' },
+      403
     );
   }
 
@@ -1809,7 +1919,7 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -1846,6 +1956,16 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
       400
+    );
+  }
+
+  // Validate the sender belongs to the authenticated origin server
+  const v2InviteOrigin = (c as any).get('federationOrigin');
+  const v2SenderServer = inviteEvent.sender?.split(':')[1];
+  if (v2InviteOrigin && v2SenderServer && v2SenderServer !== v2InviteOrigin) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'Sender does not belong to the authenticated origin server' },
+      403
     );
   }
 
@@ -2002,7 +2122,7 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2107,7 +2227,7 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2422,7 +2542,7 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
 
   let body: any;
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -2780,7 +2900,7 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }
@@ -3194,7 +3314,7 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
   };
 
   try {
-    body = await c.req.json();
+    body = await getFederationBody(c);
   } catch {
     return Errors.badJson().toResponse();
   }

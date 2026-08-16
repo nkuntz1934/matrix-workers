@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. The live instance runs at `m.easydemo.org`.
+Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. This fork's live instance runs at `matrix.fuzzywigg.com` (upstream demo: `m.easydemo.org`).
 
 ## Development Commands
 
@@ -33,12 +33,14 @@ npm run db:migrate:local # Run D1 migrations (local)
 - `src/types/` — `env.ts` (Cloudflare bindings), `matrix.ts` (PDU/event types).
 - `src/utils/` — `crypto.ts` (hashing/signing), `ids.ts` (Matrix ID generation), `errors.ts` (MatrixApiError + Errors factory).
 - `src/admin/dashboard.ts` — Embedded admin web UI at `/admin`.
-- `migrations/` — D1 schema files (schema.sql + numbered migrations 002–011).
+- `migrations/` — D1 schema files (schema.sql + numbered migrations 002–019). Two files share the `005_` prefix (`005_idp_providers.sql`, `005_server_config.sql`) and two share the `017_` prefix (`017_query_optimization_and_size_limits.sql`, `017_room_memberships_unique.sql`); do not renumber existing files in place (see `DEPLOY.md`).
 
 **Storage bindings (defined in `wrangler.jsonc`):**
-- D1 `tuwunel-db` — Relational data (users, rooms, events, memberships, etc.)
+- D1 `matrix-db` (binding `DB`) — Relational data (users, rooms, events, memberships, etc.)
 - KV namespaces: `SESSIONS`, `DEVICE_KEYS`, `ONE_TIME_KEYS`, `CROSS_SIGNING_KEYS`, `CACHE`, `ACCOUNT_DATA`
 - R2 `MEDIA` — Media file storage
+
+**Durable Object migrations:** every DO class must be declared via `new_sqlite_classes` in a `wrangler.jsonc` `migrations` entry (all 8 classes covered by tags `v1`–`v6`). New DOs need a new migration tag with the class in `new_sqlite_classes` — never `new_classes` (legacy KV-backed, unavailable on free plan), never edit deployed tags.
 
 **Key patterns:**
 - Auth: token from `Authorization: Bearer` or `?access_token=`, SHA-256 hashed, looked up in D1 `access_tokens`. Middleware sets `userId`/`deviceId` on context.
