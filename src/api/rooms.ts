@@ -1511,11 +1511,11 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     ORDER BY origin_server_ts ASC LIMIT ?
   `).bind(roomId, targetEvent.origin_server_ts, halfLimit).all();
 
-  // Format events
+  // getEvent returns a parsed PDU; the surrounding queries return raw D1 rows.
   const formatEvent = (e: any) => ({
-    type: e.event_type,
+    type: e.type ?? e.event_type,
     state_key: e.state_key,
-    content: JSON.parse(e.content || '{}'),
+    content: typeof e.content === 'string' ? JSON.parse(e.content) : e.content,
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,

@@ -548,6 +548,7 @@ app.post('/_matrix/client/v3/user/:userId/openid/request_token', requireAuth(), 
   // The token maps to the user ID so services can verify who the token belongs to
   const tokenData = {
     user_id: requestingUserId,
+    device_id: c.get('deviceId'),
     created_at: Date.now(),
     expires_at: Date.now() + (expiresIn * 1000),
   };

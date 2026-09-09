@@ -2,9 +2,11 @@
 // Provides LiveKit JWT tokens for Element X calls
 // Also implements MSC4143 RTC transports discovery
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { AppEnv } from '../types';
 import { generateLiveKitToken, getLiveKitConfig } from '../services/livekit';
+import { getOpenIDIdentity } from '../services/openid';
+import { getMembership } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -32,278 +34,117 @@ app.get('/_matrix/client/unstable/org.matrix.msc4143/rtc/transports', (c) => {
   });
 });
 
-// OpenID token structure from Matrix client
-interface OpenIDToken {
-  access_token: string;
-  token_type: string;
-  matrix_server_name: string;
-  expires_in: number;
+// Both the legacy /sfu/get and the newer member-based request authenticate via
+// the OpenID token in the body. Requiring a Matrix Bearer header breaks widgets.
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-// Member info from request
-interface MemberInfo {
-  id: string;
-  claimed_user_id: string;
-  claimed_device_id: string;
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
 }
 
-// Request body for /get_token
-// Note: Element X sends 'room' not 'room_id', and 'device_id' not 'member'
-interface GetTokenRequest {
-  room_id?: string;  // Old format
-  room?: string;     // Element X format
-  slot_id?: string;
-  openid_token: OpenIDToken;
-  member?: MemberInfo;  // Old format
-  device_id?: string;   // Element X format - device ID string
-  delayed_event_id?: string;
+// MatrixRTC / lk-jwt-service hashes JSON arrays using standard unpadded base64.
+async function rtcIdentifier(parts: string[]): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(parts));
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/=+$/, '');
 }
 
-// Response for /get_token
-interface GetTokenResponse {
-  url: string;
-  jwt: string;
-}
-
-// Verify OpenID token with the homeserver
-async function verifyOpenIDToken(
-  token: OpenIDToken,
-  serverName: string
-): Promise<{ sub: string } | null> {
-  try {
-    // The OpenID token should be verified against the homeserver
-    // For our own homeserver, we can verify it directly
-    if (token.matrix_server_name !== serverName) {
-      console.log('Token from different server:', token.matrix_server_name);
-      // For federated calls, we'd need to verify with the remote server
-      // For now, we only accept tokens from our own server
-      return null;
-    }
-
-    // For our own tokens, we trust them if they came from our server
-    // In production, you'd want to validate the token signature or check against storage
-    // For simplicity, we'll accept tokens that match our server name
-    return { sub: token.access_token };
-  } catch (error) {
-    console.error('Error verifying OpenID token:', error);
-    return null;
-  }
-}
-
-// Convert Matrix room ID to a valid LiveKit room name
-function roomIdToLiveKitName(roomId: string): string {
-  // LiveKit room names can only contain alphanumeric, dash, underscore
-  // Matrix room IDs look like: !roomid:server.name
-  return roomId.replace(/[^a-zA-Z0-9-_]/g, '_');
-}
-
-// POST /livekit/get_token - Get a LiveKit JWT token
-// This is the endpoint that Element X calls to get call credentials
-app.post('/livekit/get_token', async (c) => {
+async function getToken(c: Context<AppEnv>) {
   const config = getLiveKitConfig(c.env);
   if (!config) {
-    return c.json(
-      { errcode: 'M_UNKNOWN', error: 'LiveKit not configured' },
-      500
-    );
+    return c.json({ errcode: 'M_UNKNOWN', error: 'LiveKit not configured' }, 503);
   }
 
-  let body: GetTokenRequest;
+  let body: unknown;
   try {
     body = await c.req.json();
   } catch {
-    return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Invalid JSON body' },
-      400
-    );
+    return c.json({ errcode: 'M_BAD_JSON', error: 'Invalid JSON body' }, 400);
+  }
+  if (!isObject(body)) {
+    return c.json({ errcode: 'M_BAD_JSON', error: 'Expected a JSON object' }, 400);
   }
 
-  // Handle both old format (room_id, member) and Element X format (room, device_id)
-  const roomId = body.room_id || body.room;
-
-  // Validate required fields
-  if (!roomId || !body.openid_token) {
-    return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Missing required fields: room and openid_token' },
-      400
-    );
+  const roomId = body.room_id ?? body.room;
+  const token = body.openid_token;
+  if (!nonEmptyString(roomId) || !roomId.startsWith('!') ||
+      !isObject(token) || !nonEmptyString(token.access_token) ||
+      !nonEmptyString(token.matrix_server_name)) {
+    return c.json({ errcode: 'M_BAD_JSON', error: 'Missing or invalid room and openid_token' }, 400);
   }
 
-  // Verify the OpenID token (simplified for now)
-  // In production, you'd verify the token cryptographically
-  const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME);
-  if (!verified) {
-    // For now, accept all tokens from our server's clients
-    // This is a simplification - in production you'd verify properly
-    console.log('OpenID token verification skipped for development');
+  // This integrated service currently supports local users only. Never fetch a
+  // client-supplied server URL or fall back to accepting an unverified identity.
+  if (token.matrix_server_name !== c.env.SERVER_NAME) {
+    return c.json({ errcode: 'M_UNKNOWN_TOKEN', error: 'Invalid or expired OpenID token' }, 401);
+  }
+  const identity = await getOpenIDIdentity(c.env, token.access_token);
+  if (!identity) {
+    return c.json({ errcode: 'M_UNKNOWN_TOKEN', error: 'Invalid or expired OpenID token' }, 401);
   }
 
-  // Generate participant identity - use access_token as identity if no member info
-  let participantId: string;
-  let participantName: string;
-
-  if (body.member) {
-    participantId = body.member.claimed_user_id;
-    participantName = participantId.split(':')[0].replace('@', '');
+  let deviceId: string;
+  let memberId: string | undefined;
+  let slotId = 'm.call#ROOM';
+  if (body.member !== undefined) {
+    if (!isObject(body.member) || !nonEmptyString(body.member.claimed_device_id) ||
+        !nonEmptyString(body.member.id) || !nonEmptyString(body.slot_id)) {
+      return c.json({ errcode: 'M_BAD_JSON', error: 'Missing or invalid member and slot_id' }, 400);
+    }
+    if (body.member.claimed_user_id !== identity.user_id) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Member identity does not match OpenID token' }, 403);
+    }
+    deviceId = body.member.claimed_device_id;
+    memberId = body.member.id;
+    slotId = body.slot_id;
   } else {
-    participantId = body.device_id || body.openid_token.access_token.substring(0, 16);
-    participantName = body.device_id || 'participant';
+    if (!nonEmptyString(body.device_id)) {
+      return c.json({ errcode: 'M_BAD_JSON', error: 'Missing device_id' }, 400);
+    }
+    deviceId = body.device_id;
   }
 
-  // Convert Matrix room ID to LiveKit room name
-  const liveKitRoom = roomIdToLiveKitName(roomId);
-
-  try {
-    // Generate JWT token for this participant
-    const jwt = await generateLiveKitToken(
-      config.apiKey,
-      config.apiSecret,
-      liveKitRoom,
-      participantId,
-      participantName,
-      3600 // 1 hour TTL
-    );
-
-    const response: GetTokenResponse = {
-      url: config.wsUrl,
-      jwt: jwt,
-    };
-
-    return c.json(response);
-  } catch (error) {
-    console.error('Error generating LiveKit token:', error);
-    return c.json(
-      { errcode: 'M_UNKNOWN', error: 'Failed to generate token' },
-      500
-    );
+  if (identity.device_id != null && identity.device_id !== deviceId) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: 'Device does not match OpenID token' }, 403);
   }
-});
+  const device = await c.env.DB.prepare(`
+    SELECT d.device_id FROM devices d JOIN users u ON u.user_id = d.user_id
+    WHERE d.user_id = ? AND d.device_id = ? AND u.is_deactivated = 0
+  `).bind(identity.user_id, deviceId).first();
+  const membership = await getMembership(c.env.DB, roomId, identity.user_id);
+  if (!device || membership?.membership !== 'join') {
+    return c.json({ errcode: 'M_FORBIDDEN', error: 'An active device and joined room membership are required' }, 403);
+  }
 
-// OPTIONS handler for CORS preflight
-app.options('/livekit/get_token', () => {
-  return new Response(null, {
+  // Legacy Element Call matches SFU participants to call membership with this
+  // exact user:device identity. A device ID alone cannot match its own member.
+  const participantId = memberId === undefined
+    ? `${identity.user_id}:${deviceId}`
+    : await rtcIdentifier([identity.user_id, deviceId, memberId]);
+  const liveKitRoom = await rtcIdentifier([roomId, slotId]);
+  const jwt = await generateLiveKitToken(
+    config.apiKey, config.apiSecret, liveKitRoom, participantId, identity.user_id,
+    Math.min(3600, Math.max(1, Math.floor((identity.expires_at - Date.now()) / 1000))),
+  );
+  c.header('Cache-Control', 'no-store');
+  return c.json({ url: config.wsUrl, jwt });
+}
+
+// Keep the existing service URL and both client request formats. Newer clients
+// append /get_token to the advertised base, while legacy clients append /sfu/get.
+for (const path of ['/livekit/get_token', '/livekit/get_token/sfu/get', '/livekit/get_token/get_token']) {
+  app.post(path, getToken);
+  app.options(path, () => new Response(null, {
     status: 204,
     headers: {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     },
-  });
-});
-
-// POST /livekit/get_token/sfu/get - Alternative endpoint format used by Element X
-// This is the same as /livekit/get_token but with /sfu/get suffix
-app.post('/livekit/get_token/sfu/get', async (c) => {
-  console.log('[LiveKit] /sfu/get request received');
-
-  const config = getLiveKitConfig(c.env);
-  if (!config) {
-    console.log('[LiveKit] Config missing - API_KEY:', !!c.env.LIVEKIT_API_KEY, 'API_SECRET:', !!c.env.LIVEKIT_API_SECRET, 'URL:', !!c.env.LIVEKIT_URL);
-    return c.json(
-      { errcode: 'M_UNKNOWN', error: 'LiveKit not configured' },
-      500
-    );
-  }
-
-  let body: GetTokenRequest;
-  try {
-    const rawBody = await c.req.text();
-    console.log('[LiveKit] Raw body length:', rawBody.length, 'preview:', rawBody.substring(0, 200));
-    body = JSON.parse(rawBody);
-  } catch (e) {
-    console.log('[LiveKit] JSON parse error:', e);
-    return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Invalid JSON body' },
-      400
-    );
-  }
-
-  // Handle both old format (room_id, member) and Element X format (room, device_id)
-  const roomId = body.room_id || body.room;
-
-  // Validate required fields
-  if (!roomId || !body.openid_token) {
-    console.log('[LiveKit] Missing fields - room_id:', !!body.room_id, 'room:', !!body.room, 'openid_token:', !!body.openid_token);
-    return c.json(
-      { errcode: 'M_BAD_JSON', error: 'Missing required fields: room and openid_token' },
-      400
-    );
-  }
-
-  // Verify the OpenID token (simplified for now)
-  const verified = await verifyOpenIDToken(body.openid_token, c.env.SERVER_NAME);
-  if (!verified) {
-    console.log('OpenID token verification skipped for development');
-  }
-
-  // Generate participant identity - use access_token as identity if no member info
-  // Element X doesn't send member info, just device_id
-  let participantId: string;
-  let participantName: string;
-
-  if (body.member) {
-    participantId = body.member.claimed_user_id;
-    participantName = participantId.split(':')[0].replace('@', '');
-  } else {
-    // For Element X, derive identity from openid_token
-    // The access_token's user can be looked up, but for simplicity use device_id
-    participantId = body.device_id || body.openid_token.access_token.substring(0, 16);
-    participantName = body.device_id || 'participant';
-  }
-
-  // Convert Matrix room ID to LiveKit room name
-  const liveKitRoom = roomIdToLiveKitName(roomId);
-
-  try {
-    // Generate JWT token for this participant
-    const jwt = await generateLiveKitToken(
-      config.apiKey,
-      config.apiSecret,
-      liveKitRoom,
-      participantId,
-      participantName,
-      3600 // 1 hour TTL
-    );
-
-    const response: GetTokenResponse = {
-      url: config.wsUrl,
-      jwt: jwt,
-    };
-
-    return c.json(response);
-  } catch (error) {
-    console.error('Error generating LiveKit token:', error);
-    return c.json(
-      { errcode: 'M_UNKNOWN', error: 'Failed to generate token' },
-      500
-    );
-  }
-});
-
-// OPTIONS handler for /sfu/get endpoint
-app.options('/livekit/get_token/sfu/get', () => {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    },
-  });
-});
-
-// Return 405 Method Not Allowed for non-POST/OPTIONS methods
-// Element X checks endpoint availability with GET and expects 405 (not 404)
-app.all('/livekit/get_token', (c) => {
-  return c.text('Method Not Allowed', 405, {
-    Allow: 'POST, OPTIONS',
-  });
-});
-
-app.all('/livekit/get_token/sfu/get', (c) => {
-  return c.text('Method Not Allowed', 405, {
-    Allow: 'POST, OPTIONS',
-  });
-});
+  }));
+  app.all(path, (c) => c.text('Method Not Allowed', 405, { Allow: 'POST, OPTIONS' }));
+}
 
 export default app;
