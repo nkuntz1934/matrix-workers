@@ -14,6 +14,7 @@ import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoomState } from '../services/database';
 import { resolveState } from '../services/state-resolution';
+import { getOpenIDIdentity } from '../services/openid';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
@@ -29,6 +30,20 @@ app.get('/_matrix/federation/v1/version', async (c) => {
       version: c.env.SERVER_VERSION || '0.1.0',
     },
   });
+});
+
+// OpenID userinfo authenticates with its own short-lived token, not X-Matrix.
+// Register it before the federation middleware so external RTC services can use it.
+app.get('/_matrix/federation/v1/openid/userinfo', async (c) => {
+  const accessToken = c.req.query('access_token');
+  if (!accessToken) return Errors.missingParam('access_token').toResponse();
+
+  const identity = await getOpenIDIdentity(c.env, accessToken);
+  if (!identity) {
+    return c.json({ errcode: 'M_UNKNOWN_TOKEN', error: 'Invalid or expired OpenID token' }, 401);
+  }
+  c.header('Cache-Control', 'no-store');
+  return c.json({ sub: identity.user_id });
 });
 
 // Apply federation authentication to all other federation v1 endpoints
@@ -3123,42 +3138,6 @@ app.get('/_matrix/federation/v1/timestamp_to_event/:roomId', async (c) => {
   return c.json({
     event_id: event.event_id,
     origin_server_ts: event.origin_server_ts,
-  });
-});
-
-// GET /_matrix/federation/v1/openid/userinfo - Validate OpenID token and return user info
-app.get('/_matrix/federation/v1/openid/userinfo', async (c) => {
-  const accessToken = c.req.query('access_token');
-
-  if (!accessToken) {
-    return Errors.missingParam('access_token').toResponse();
-  }
-
-  // Look up the OpenID token in KV
-  const tokenData = await c.env.SESSIONS.get(`openid:${accessToken}`, 'json') as {
-    user_id: string;
-    expires_at: number;
-  } | null;
-
-  if (!tokenData) {
-    return c.json({
-      errcode: 'M_UNKNOWN_TOKEN',
-      error: 'Invalid or expired OpenID token',
-    }, 401);
-  }
-
-  // Check if token has expired
-  if (Date.now() > tokenData.expires_at) {
-    // Clean up expired token
-    await c.env.SESSIONS.delete(`openid:${accessToken}`);
-    return c.json({
-      errcode: 'M_UNKNOWN_TOKEN',
-      error: 'OpenID token has expired',
-    }, 401);
-  }
-
-  return c.json({
-    sub: tokenData.user_id,
   });
 });
 

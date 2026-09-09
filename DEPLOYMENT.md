@@ -475,6 +475,27 @@ If you have a LiveKit server:
    npx wrangler secret put LIVEKIT_API_SECRET
    ```
 
+The integrated LiveKit token service accepts **local users only**. Clients exchange
+the short-lived OpenID token from `/user/:userId/openid/request_token` in the JSON
+body; do not put Matrix Bearer-auth middleware in front of `/livekit/get_token`
+or its child endpoints. The service verifies the token in `CACHE`, its expiry,
+the user's active device, and joined room membership before issuing a JWT.
+OpenID `userinfo` uses that same token store and does not require an `X-Matrix`
+header. Keep the other federation endpoints behind signature authentication.
+
+The service supports legacy `room`/`device_id` requests and member-based
+`room_id`/`slot_id`/`member` requests. Legacy participant identities use
+`<Matrix user ID>:<device ID>`; member-based identities and room aliases use the
+MatrixRTC hash format. After upgrading from the previous identity/room mapping,
+all participants must leave existing calls and rejoin on the upgraded service.
+Previously issued LiveKit JWTs remain valid until their expiry.
+
+This Worker supplies tokens, not the SFU itself. Verify that `LIVEKIT_URL` points
+to a reachable LiveKit SFU whose API key and secret match the Worker. A successful
+token exchange does not establish that audio/video connectivity or every client
+version's call membership synchronization works. Delegated delayed-leave handling
+is not implemented here.
+
 ### APNs Push Notifications (iOS)
 
 For direct Apple Push Notification support:
